@@ -8,7 +8,7 @@ on:
 
 jobs:
   backend-and-migrations:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -35,18 +35,58 @@ jobs:
           pip install -e ".[dev]" -e ./local_node
       - name: Run Ruff static analysis
         run: ruff check backend local_node tests migrations
-      - name: Verify Alembic PostgreSQL migrations (live pgvector:pg16)
+      - name: Verify Alembic PostgreSQL migrations & provision NOBYPASSRLS app role
         env:
           APEX_DATABASE_URL: postgresql+asyncpg://apex_ci:apex_ci_password@127.0.0.1:5432/apex_one_ci
+          APEX_ADMIN_DSN: postgresql://apex_ci:apex_ci_password@127.0.0.1:5432/apex_one_ci
         run: |
           alembic upgrade head
+          python - <<'PY'
+          import os
+          import psycopg
+
+          with psycopg.connect(os.environ["APEX_ADMIN_DSN"], autocommit=True) as conn:
+              with conn.cursor() as cur:
+                  cur.execute(
+                      """
+                      DO $$
+                      BEGIN
+                          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'apex_app') THEN
+                              CREATE ROLE apex_app LOGIN PASSWORD 'apex_app_ci_password'
+                                  NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+                          END IF;
+                      END
+                      $$;
+                      """
+                  )
+                  cur.execute("GRANT CONNECT ON DATABASE apex_one_ci TO apex_app")
+                  cur.execute("GRANT USAGE ON SCHEMA public TO apex_app")
+                  cur.execute(
+                      "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO apex_app"
+                  )
+                  cur.execute(
+                      "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO apex_app"
+                  )
+                  cur.execute(
+                      "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+                      "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO apex_app"
+                  )
+          PY
       - name: Run Full Pytest Suite (Unit + API + PostgreSQL Integration + RLS Security)
         env:
-          APEX_DATABASE_URL: postgresql+asyncpg://apex_ci:apex_ci_password@127.0.0.1:5432/apex_one_ci
-        run: pytest -v
+          APEX_DATABASE_URL: postgresql+asyncpg://apex_app:apex_app_ci_password@127.0.0.1:5432/apex_one_ci
+        run: |
+          set +e
+          pytest -v --tb=short 2>&1 | tee /tmp/pytest_ci.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            summary=$(grep -E "FAILED|ERROR|AssertionError|E   " /tmp/pytest_ci.log | head -n 20 | tr '\n' ' ')
+            echo "::error title=Pytest Failure::${summary}"
+            exit "$rc"
+          fi
 
   frontend-and-runtime:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
