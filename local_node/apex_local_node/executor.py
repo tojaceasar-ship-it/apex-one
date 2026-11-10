@@ -153,4 +153,68 @@ class LocalNodeTaskExecutor:
             except Exception as exc:
                 return {"reachable": False, "models": [], "error": str(exc)}
 
+        if method == "lmstudio.probe":
+            base = self._policy.lmstudio_base_url.rstrip("/")
+            url = f"{base}/models" if base.endswith("/v1") else f"{base}/v1/models"
+            req = UrlRequest(url=url, method="GET")
+            try:
+                with urlopen(req, timeout=3.0) as resp:  # nosec B310
+                    body = json.loads(resp.read().decode("utf-8", errors="replace"))
+                models = [
+                    str(m.get("id", ""))
+                    for m in (body.get("data") or [])
+                    if isinstance(m, dict)
+                ]
+                return {"reachable": True, "endpoint": base, "models": models}
+            except Exception as exc:
+                return {"reachable": False, "endpoint": base, "models": [], "error": str(exc)}
+
+        if method == "lmstudio.chat":
+            base = self._policy.lmstudio_base_url.rstrip("/")
+            url = (
+                f"{base}/chat/completions"
+                if base.endswith("/v1")
+                else f"{base}/v1/chat/completions"
+            )
+            model_id = str(
+                params.get("model") or self._policy.lmstudio_default_model
+            )
+            payload = json.dumps(
+                {
+                    "model": model_id,
+                    "temperature": float(params.get("temperature", 0.2)),
+                    "max_tokens": int(params.get("max_tokens", 1600)),
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": str(params.get("system_prompt", "You are a research agent.")),
+                        },
+                        {"role": "user", "content": str(params.get("prompt", ""))},
+                    ],
+                }
+            ).encode("utf-8")
+            req = UrlRequest(
+                url=url,
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer lm-studio",
+                },
+                method="POST",
+            )
+            with urlopen(req, timeout=90.0) as resp:  # nosec B310
+                body = json.loads(resp.read().decode("utf-8", errors="replace"))
+            choices = body.get("choices") or []
+            content = (
+                str((choices[0].get("message") or {}).get("content") or "")
+                if choices
+                else ""
+            )
+            return {
+                "model": model_id,
+                "endpoint": base,
+                "content": content,
+                "usage": body.get("usage") or {},
+            }
+
         raise LocalNodeCapabilityError(f"Unsupported or disallowed method '{method}'.")

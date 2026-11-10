@@ -775,6 +775,9 @@ export function RunsExecutionsPage() {
               onChange={(e) => setModelId(e.target.value)}
               className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-zinc-100"
             >
+              <option value="qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive">
+                LM Studio LAN (192.168.18.184:1234) · qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive
+              </option>
               <option value="apex-analytical-local-v1">APEX Analytical v1 (Auto / Fallback)</option>
               <option value="gpt-4.1-mini">OpenAI · gpt-4.1-mini</option>
               <option value="claude-sonnet-4-0">Anthropic · claude-sonnet-4-0</option>

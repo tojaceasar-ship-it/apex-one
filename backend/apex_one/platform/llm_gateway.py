@@ -43,6 +43,13 @@ def _validate_llm_endpoint(url: str) -> str:
     return assert_public_http_url(url, allow_local=True)
 
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_reasoning_tags(text: str) -> str:
+    """Strip Qwen3 / DeepSeek `<think>...</think>` blocks while preserving final answer."""
+    cleaned = _THINK_BLOCK_RE.sub("", text).strip()
+    return cleaned if cleaned else text.strip()
 
 
 @dataclass(frozen=True)
@@ -116,10 +123,12 @@ def _normalize_to_1536(raw_vec: list[float]) -> list[float]:
 class LLMGateway:
     """Provider-neutral LLM & Embedding client with fallback and secret isolation."""
 
-    def __init__(self, *, http_timeout: float = 25.0) -> None:
+    def __init__(self, *, http_timeout: float = 90.0) -> None:
         self._timeout = http_timeout
         # Keyed by (organization_id, provider_slug) -> secret string (never serialized)
         self._runtime_secrets: dict[tuple[str, str], str] = {}
+        # Short-lived circuit breaker for unreachable private LAN hosts
+        self._unreachable_until: dict[str, float] = {}
 
     def set_runtime_secret(
         self,
@@ -172,6 +181,8 @@ class LLMGateway:
                 or os.environ.get("OLLAMA_BASE_URL")
                 or self._runtime_secrets.get((organization_id, slug))
             )
+        if provider_cfg.get("auth_env_var") is None and cat == "compatible_http":
+            return bool(str(provider_cfg.get("base_url") or "").startswith(("http://", "https://")))
         return (
             self.resolve_api_key(
                 organization_id=organization_id, provider_cfg=provider_cfg
@@ -198,7 +209,8 @@ class LLMGateway:
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.2,
-        max_tokens: int = 900,
+        max_tokens: int = 1600,
+        bypass_circuit_breaker: bool = False,
     ) -> LLMCompletionResult | None:
         """Attempt live LLM completion with automatic fallback across configured providers.
 
@@ -238,6 +250,14 @@ class LLMGateway:
             if fb_slug and fb_slug in by_slug and fb_slug not in visited and fb_slug != "apex-analytical":
                 queue.append(by_slug[fb_slug])
 
+            if (
+                not bypass_circuit_breaker
+                and self._unreachable_until.get(slug, 0.0) > time.monotonic()
+            ):
+                last_err = f"{slug}: ConnectTimeout (cached unreachable LAN endpoint)"
+                fallback_used = True
+                continue
+
             model_id = preferred_model
             if "/" in model_id and model_id.split("/", 1)[0] in by_slug:
                 model_id = model_id.split("/", 1)[1]
@@ -256,7 +276,12 @@ class LLMGateway:
                     max_tokens=max_tokens,
                     fallback_triggered=fallback_used,
                 )
+                self._unreachable_until.pop(slug, None)
                 return res
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                self._unreachable_until[slug] = time.monotonic() + 30.0
+                last_err = f"{slug}: {type(exc).__name__}: {exc}"
+                fallback_used = True
             except Exception as exc:
                 last_err = f"{slug}: {type(exc).__name__}: {exc}"
                 fallback_used = True
@@ -361,8 +386,8 @@ class LLMGateway:
             p_tok = int(data.get("prompt_eval_count") or max(1, len(user_prompt) // 4))
             c_tok = int(data.get("eval_count") or max(1, len(text_out) // 4))
         else:
-            # OpenAI / OpenRouter / vLLM / Compatible HTTP (`/v1/chat/completions`)
-            if not api_key and cat == "cloud":
+            # OpenAI / OpenRouter / LM Studio / vLLM / Compatible HTTP (`/v1/chat/completions`)
+            if not api_key and cat in {"cloud", "commercial_cloud"}:
                 raise RuntimeError(f"Missing API key for provider '{slug}'")
             root = base_url or "https://api.openai.com/v1"
             endpoint = (
@@ -372,9 +397,17 @@ class LLMGateway:
             )
             _validate_llm_endpoint(endpoint)
             headers = {"Content-Type": "application/json"}
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
-            with httpx.Client(timeout=self._timeout, verify=ssl.create_default_context()) as client:
+            headers["Authorization"] = f"Bearer {api_key or 'lm-studio'}"
+            client_timeout = httpx.Timeout(
+                connect=2.5,
+                read=max(60.0, self._timeout),
+                write=15.0,
+                pool=5.0,
+            )
+            with httpx.Client(
+                timeout=client_timeout,
+                verify=ssl.create_default_context(),
+            ) as client:
                 resp = client.post(
                     endpoint,
                     headers=headers,
@@ -391,11 +424,10 @@ class LLMGateway:
                 resp.raise_for_status()
                 data = resp.json()
             choices = data.get("choices") or []
-            text_out = (
-                str((choices[0].get("message") or {}).get("content") or "").strip()
-                if choices
-                else ""
-            )
+            msg_obj = (choices[0].get("message") or {}) if choices else {}
+            raw_content = str(msg_obj.get("content") or "").strip()
+            reasoning_fallback = str(msg_obj.get("reasoning_content") or "").strip()
+            text_out = _strip_reasoning_tags(raw_content or reasoning_fallback)
             usage = data.get("usage") or {}
             p_tok = int(usage.get("prompt_tokens") or max(1, len(user_prompt) // 4))
             c_tok = int(usage.get("completion_tokens") or max(1, len(text_out) // 4))

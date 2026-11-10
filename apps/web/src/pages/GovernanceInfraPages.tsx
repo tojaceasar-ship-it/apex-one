@@ -168,10 +168,12 @@ export function ModelsProvidersPage() {
   const [slug, setSlug] = useState("");
   const [name, setName] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
-  const [secretSlug, setSecretSlug] = useState("openai-compatible-cloud");
+  const [secretSlug, setSecretSlug] = useState("lmstudio-lan-qwen");
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [overrideBaseUrl, setOverrideBaseUrl] = useState("");
-  const [testModel, setTestModel] = useState("gpt-4.1-mini");
+  const [testModel, setTestModel] = useState(
+    "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"
+  );
   const [testPrompt, setTestPrompt] = useState(
     "Podsumuj w dwóch zdaniach znaczenie niezależnej weryfikacji źródeł pierwotnych."
   );
@@ -331,12 +333,19 @@ export function ModelsProvidersPage() {
           </h3>
           <form onSubmit={handleTestInference} className="space-y-3 text-xs">
             <div className="flex gap-2">
-              <input
+              <select
                 value={testModel}
                 onChange={(e) => setTestModel(e.target.value)}
-                placeholder="Model (np. gpt-4.1-mini, claude-sonnet-4-0, llama3.2)"
                 className="flex-1 rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-zinc-100"
-              />
+              >
+                <option value="qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive">
+                  LM Studio LAN (192.168.18.184:1234) · qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive
+                </option>
+                <option value="gpt-4.1-mini">OpenAI · gpt-4.1-mini</option>
+                <option value="claude-sonnet-4-0">Anthropic · claude-sonnet-4-0</option>
+                <option value="llama3.2">Ollama · llama3.2</option>
+                <option value="apex-analytical-local-v1">APEX Analytical v1</option>
+              </select>
               <button
                 type="submit"
                 className="rounded-lg bg-emerald-600 px-4 py-2 font-semibold text-white hover:bg-emerald-500"

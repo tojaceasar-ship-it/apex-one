@@ -45,6 +45,9 @@ export function ExperimentLabPage() {
   const [execMode, setExecMode] = useState<"multi_agent_team" | "single_agent">(
     "multi_agent_team"
   );
+  const [expModel, setExpModel] = useState(
+    "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"
+  );
   const [sandboxMsg, setSandboxMsg] = useState<string | null>(null);
   const [reproMsg, setReproMsg] = useState<string | null>(null);
 
@@ -75,6 +78,7 @@ export function ExperimentLabPage() {
         dataset_id: datasetId,
         dataset_version: 1,
         execution_mode: execMode,
+        model_identifier: expModel,
       }),
     });
     setName("");
@@ -145,7 +149,7 @@ export function ExperimentLabPage() {
           <FlaskConical className="h-4 w-4 text-indigo-400" />
           Uruchom Kontrolowany Eksperyment Badawczy
         </h2>
-        <form onSubmit={handleCreateExperiment} className="grid grid-cols-1 gap-3 md:grid-cols-4 text-xs">
+        <form onSubmit={handleCreateExperiment} className="grid grid-cols-1 gap-3 md:grid-cols-5 text-xs">
           <input
             required
             value={name}
@@ -171,6 +175,18 @@ export function ExperimentLabPage() {
           >
             <option value="multi_agent_team">Multi-Agent Team (8 ról)</option>
             <option value="single_agent">Single-Agent Baseline</option>
+          </select>
+          <select
+            value={expModel}
+            onChange={(e) => setExpModel(e.target.value)}
+            className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-zinc-100"
+          >
+            <option value="qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive">
+              qwen3.6-35b-a3b (192.168.18.184:1234)
+            </option>
+            <option value="apex-analytical-local-v1">APEX Analytical v1</option>
+            <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+            <option value="claude-sonnet-4-0">claude-sonnet-4-0</option>
           </select>
           <button
             type="submit"

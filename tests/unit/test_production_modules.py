@@ -46,15 +46,21 @@ class _MockLLMWireHandler(BaseHTTPRequestHandler):
             return
 
         if self.path.endswith("/chat/completions"):
+            req_model = str(body.get("model", "gpt-4.1-mini"))
+            msg_content = (
+                "<think>\nAnalyzing methodology...\n</think>\nQwen3.6 LAN synthesis confirmed."
+                if "qwen3.6" in req_model
+                else "Empirical verification confirmed across primary sources."
+            )
             resp = {
                 "id": "chatcmpl-live-1",
-                "model": body.get("model", "gpt-4.1-mini"),
+                "model": req_model,
                 "choices": [
                     {
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": "Empirical verification confirmed across primary sources.",
+                            "content": msg_content,
                         },
                     }
                 ],
@@ -331,4 +337,49 @@ async def test_rootless_container_sandbox_command_hardening_and_attestation_gate
     assert "--cap-drop=ALL" in cmd
     assert "--security-opt=no-new-privileges" in cmd
     assert "--user=65534:65534" in cmd
+
+
+def test_lmstudio_lan_qwen36_provider_and_think_tag_stripping() -> None:
+    svc = ApexPlatformService(seed_demo=True)
+    login = svc.login(email="admin@apex-one.local", password="ApexResearch!2026")
+    uid = login["user"]["id"]
+    oid = login["active_organization_id"]
+
+    providers = svc.list_model_providers(user_id=uid, organization_id=oid)
+    lmstudio = next(p for p in providers if p["slug"] == "lmstudio-lan-qwen")
+    assert lmstudio["base_url"] == "http://192.168.18.184:1234/v1"
+    assert lmstudio["credentials_present"] is True
+    assert (
+        lmstudio["models"][0]["id"]
+        == "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"
+    )
+
+    # Point base_url to local wire mock server to verify keyless LM Studio + <think> stripping
+    server = HTTPServer(("127.0.0.1", 0), _MockLLMWireHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        svc.configure_model_provider_secret(
+            user_id=uid,
+            organization_id=oid,
+            provider_slug="lmstudio",
+            api_key="",
+            base_url=f"http://127.0.0.1:{port}/v1",
+        )
+        res = svc.test_model_provider_inference(
+            user_id=uid,
+            organization_id=oid,
+            model_identifier="qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
+            prompt="Synthesize evidence.",
+        )
+        assert res["live_llm_invoked"] is True
+        assert res["provider_slug"] == "lmstudio-lan-qwen"
+        assert res["model_identifier"] == "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"
+        assert res["cost_usd"] == 0.0
+        assert "<think>" not in res["content"]
+        assert "Qwen3.6 LAN synthesis confirmed." in res["content"]
+    finally:
+        server.shutdown()
+
 

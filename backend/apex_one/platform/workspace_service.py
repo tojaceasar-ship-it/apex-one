@@ -2064,6 +2064,7 @@ class ApexPlatformService:
             "openai": "openai-compatible-cloud",
             "anthropic": "anthropic-cloud",
             "ollama": "ollama-local",
+            "lmstudio": "lmstudio-lan-qwen",
         }
         resolved_slug = alias_map.get(provider_slug, provider_slug)
         target = next(
@@ -2118,6 +2119,7 @@ class ApexPlatformService:
             preferred_model=model_identifier,
             system_prompt="You are APEX ONE verification diagnostics.",
             user_prompt=prompt,
+            bypass_circuit_breaker=True,
         )
         if res is None:
             return {
@@ -2126,22 +2128,32 @@ class ApexPlatformService:
                 "model_identifier": "apex-analytical-local-v1",
                 "content": (
                     "Deterministic local analytical fallback active — configure an API key "
-                    "or Ollama endpoint to enable external live inference."
+                    "or LAN/Ollama endpoint to enable external live inference."
                 ),
                 "total_tokens": 0,
                 "cost_usd": 0.0,
                 "latency_ms": 1,
                 "fallback_triggered": True,
+                "error_note": None,
             }
+        content_msg = res.content
+        if not content_msg and res.error_note:
+            content_msg = (
+                f"Nie udało się połączyć z endpointem docelowym ({res.error_note}) — "
+                "aktywowano automatyczny fallback do silnika analitycznego. "
+                "Jeśli endpoint działa w prywatnej sieci LAN (np. 192.168.18.184:1234), "
+                "uruchom backend APEX ONE lub węzeł Hybrid Local Node w tej samej sieci LAN."
+            )
         return {
             "live_llm_invoked": res.live_llm_invoked,
             "provider_slug": res.provider_slug,
             "model_identifier": res.model_identifier,
-            "content": res.content,
+            "content": content_msg,
             "total_tokens": res.total_tokens,
             "cost_usd": res.cost_usd,
             "latency_ms": res.latency_ms,
             "fallback_triggered": res.fallback_triggered,
+            "error_note": res.error_note,
         }
 
     def register_model_provider(
@@ -2956,6 +2968,32 @@ class ApexPlatformService:
                 "budget_limit_usd": 100.0,
                 "models": [
                     {"id": "configurable-claude-research", "capabilities": ["reasoning", "vision", "citations"]}
+                ],
+                "enabled": True,
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "organization_id": org_id,
+                "slug": "lmstudio-lan-qwen",
+                "name": "LM Studio LAN (192.168.18.184:1234 · Qwen 3.6 35B-A3B)",
+                "category": "compatible_http",
+                "base_url": "http://192.168.18.184:1234/v1",
+                "auth_env_var": None,
+                "fallback_provider_slug": "apex-analytical",
+                "rate_limit_rpm": 300,
+                "budget_limit_usd": 0.0,
+                "models": [
+                    {
+                        "id": "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
+                        "capabilities": [
+                            "reasoning",
+                            "structured_output",
+                            "tools",
+                            "local_lan",
+                        ],
+                        "cost_per_1k_input_usd": 0.0,
+                        "cost_per_1k_output_usd": 0.0,
+                    }
                 ],
                 "enabled": True,
             },
