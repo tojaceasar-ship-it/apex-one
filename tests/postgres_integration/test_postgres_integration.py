@@ -134,7 +134,7 @@ async def test_platform_persistence_cold_restart_pgvector_and_rls_isolation(
     mem = svc1.create_memory_object(
         user_id=uid,
         organization_id=oid,
-        memory_type="finding",
+        memory_type="research",
         title=f"Finding {marker}",
         content=f"Empirical pgvector persistence marker {marker} confirmed.",
         source_ref="pg://durability-test",
