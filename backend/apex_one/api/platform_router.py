@@ -1319,10 +1319,22 @@ def create_platform_router(get_platform: Any) -> APIRouter:
         model: str = Query(default="qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"),
         ctx: dict[str, Any] = Depends(require_auth_context),
     ) -> PlainTextResponse:
+        svc: ApexPlatformService = ctx["svc"]
+        key_rec = svc.create_api_credential(
+            user_id=ctx["user_id"],
+            organization_id=ctx["organization_id"],
+            name="LAN Bridge Persistent Key",
+            scopes=["read:all", "sources:write", "models:manage", "agents:run"],
+        )
+        local_state_env = request.app.state.container and getattr(
+            request.app.state, "local_state_path", None
+        )
+        if local_state_env is not None:
+            svc.save_local_checkpoint(local_state_env)
         arena_base = (origin or str(request.base_url)).rstrip("/")
         script_body = build_lan_bridge_python_script(
             arena_base_url=arena_base,
-            auth_token=str(ctx["raw_token"] or ""),
+            auth_token=str(key_rec["secret_key_once"]),
             organization_id=ctx["organization_id"],
             lmstudio_url=lmstudio_url,
             default_model=model,

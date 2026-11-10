@@ -124,6 +124,16 @@ export async function apiFetch<T = any>(
     } catch {
       msg = (await res.text()) || msg;
     }
+    if (
+      res.status === 401 &&
+      !path.startsWith("/api/v1/auth/login") &&
+      !path.startsWith("/api/v1/auth/register")
+    ) {
+      clearStoredSession();
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new Event("apex:session-expired"));
+      }
+    }
     throw new ApiRequestError(msg, res.status, code, reqId);
   }
 

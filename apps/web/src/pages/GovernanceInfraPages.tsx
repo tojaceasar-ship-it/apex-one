@@ -23,9 +23,10 @@ import {
   UserPlus,
   XCircle,
 } from "lucide-react";
-import { apiFetch, loadStoredSession } from "../api";
+import { apiFetch } from "../api";
 import { Badge, Card, PageHeader } from "../components/Layout";
 import { useAuth } from "../context/AuthContext";
+import { browserLanBridge, BrowserRelayState } from "../lanBridgeRelay";
 
 export function WorkflowsPage() {
   const { t } = useAuth();
@@ -179,51 +180,60 @@ export function ModelsProvidersPage() {
   );
   const [testResult, setTestResult] = useState<any>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const [errMsg, setErrMsg] = useState<string | null>(null);
+  const [testingNow, setTestingNow] = useState(false);
   const [bridgeStatus, setBridgeStatus] = useState<any>(null);
   const [bridgeScriptPreview, setBridgeScriptPreview] = useState<string | null>(null);
+  const [browserRelay, setBrowserRelay] = useState<BrowserRelayState>(
+    browserLanBridge.getState()
+  );
 
   const load = async () => {
-    const [res, br] = await Promise.all([
-      apiFetch("/api/v1/models/providers"),
-      apiFetch("/api/v1/lan-bridge/status").catch(() => null),
-    ]);
-    setProviders(res.items || []);
-    if (br) setBridgeStatus(br);
+    try {
+      const [res, br] = await Promise.all([
+        apiFetch("/api/v1/models/providers"),
+        apiFetch("/api/v1/lan-bridge/status").catch(() => null),
+      ]);
+      setProviders(res.items || []);
+      if (br) setBridgeStatus(br);
+    } catch (ex: any) {
+      setErrMsg(ex.message || "Błąd ładowania dostawców modeli.");
+    }
   };
 
   useEffect(() => {
     void load();
+    const unsub = browserLanBridge.subscribe(setBrowserRelay);
     const timer = window.setInterval(() => {
       void apiFetch("/api/v1/lan-bridge/status")
         .then((br) => setBridgeStatus(br))
         .catch(() => {});
     }, 4000);
-    return () => window.clearInterval(timer);
+    return () => {
+      unsub();
+      window.clearInterval(timer);
+    };
   }, []);
 
   const fetchBridgeScriptText = async () => {
-    const sess = loadStoredSession();
     const origin = encodeURIComponent(window.location.origin);
-    const resp = await fetch(
+    const code = await apiFetch<string>(
       `/api/v1/lan-bridge/script.py?origin=${origin}&lmstudio_url=${encodeURIComponent(
         "http://192.168.18.184:1234/v1"
       )}&model=${encodeURIComponent("qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive")}`,
-      {
-        credentials: "include",
-        headers: {
-          "X-Apex-Session-Token": sess.token || "",
-          Authorization: sess.token ? `Bearer ${sess.token}` : "",
-          "X-Organization-Id": sess.organizationId || "",
-        },
-      }
+      { rawText: true }
     );
-    return await resp.text();
+    if (!code.startsWith("#!/usr/bin/env python3")) {
+      throw new Error("Nie udało się wygenerować skryptu mostu (zaloguj się ponownie).");
+    }
+    return code;
   };
 
   const handleDownloadBridgeScript = async () => {
-    const code = await fetchBridgeScriptText();
-    setBridgeScriptPreview(code);
+    setErrMsg(null);
     try {
+      const code = await fetchBridgeScriptText();
+      setBridgeScriptPreview(code);
       const blob = new Blob([code], { type: "text/x-python;charset=utf-8" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -234,25 +244,42 @@ export function ModelsProvidersPage() {
       a.remove();
       URL.revokeObjectURL(url);
       setStatusMsg(
-        "Pobrano skrypt apex_lan_bridge.py! Uruchom go na swoim komputerze: python apex_lan_bridge.py"
+        "Krok 1 gotowy: Zapisz kod poniżej (lub pobrany plik) jako apex_lan_bridge.py, uruchom `python apex_lan_bridge.py`, a następnie kliknij zielony przycisk '2. Połącz przeglądarkę z mostem lokalnym'!"
       );
-    } catch {
-      setStatusMsg(
-        "Wygenerowano kod mostu LAN poniżej — skopiuj go i zapisz jako apex_lan_bridge.py."
-      );
+    } catch (ex: any) {
+      setErrMsg(ex.message);
     }
   };
 
   const handleCopyBridgeScript = async () => {
-    const code = bridgeScriptPreview || (await fetchBridgeScriptText());
-    setBridgeScriptPreview(code);
+    setErrMsg(null);
     try {
-      await navigator.clipboard.writeText(code);
+      const code = bridgeScriptPreview || (await fetchBridgeScriptText());
+      setBridgeScriptPreview(code);
+      try {
+        await navigator.clipboard.writeText(code);
+        setStatusMsg(
+          "Skopiowano prawdziwy kod Pythona (apex_lan_bridge.py) do schowka! Zapisz go na dysku, uruchom `python apex_lan_bridge.py`, a potem kliknij '2. Połącz przeglądarkę z mostem lokalnym'."
+        );
+      } catch {
+        setStatusMsg("Zaznacz cały kod Pythona z pola tekstowego poniżej (Ctrl+A, Ctrl+C).");
+      }
+    } catch (ex: any) {
+      setErrMsg(ex.message);
+    }
+  };
+
+  const handleConnectBrowserRelay = async () => {
+    setErrMsg(null);
+    setStatusMsg(null);
+    const st = await browserLanBridge.connectAndStart();
+    if (st.active) {
       setStatusMsg(
-        "Skopiowano cały kod apex_lan_bridge.py do schowka! Zapisz go na dysku i uruchom: python apex_lan_bridge.py"
+        `POŁĄCZONO! Przeglądarka przekazuje teraz zapytania Arena Preview prosto do ${st.localTarget} (${st.models.join(", ")}). Możesz uruchomić test lub przebieg 8 agentów!`
       );
-    } catch {
-      setStatusMsg("Zaznacz i skopiuj kod mostu LAN z pola tekstowego poniżej.");
+      await load();
+    } else if (st.lastError) {
+      setErrMsg(st.lastError);
     }
   };
 
@@ -293,22 +320,38 @@ export function ModelsProvidersPage() {
 
   const handleTestInference = async (e: React.FormEvent) => {
     e.preventDefault();
-    const res = await apiFetch("/api/v1/models/test-inference", {
-      method: "POST",
-      body: JSON.stringify({
-        model_identifier: testModel,
-        prompt: testPrompt,
-      }),
-    });
-    setTestResult(res);
+    setErrMsg(null);
+    setTestingNow(true);
+    try {
+      const res = await apiFetch("/api/v1/models/test-inference", {
+        method: "POST",
+        body: JSON.stringify({
+          model_identifier: testModel,
+          prompt: testPrompt,
+        }),
+      });
+      setTestResult(res);
+    } catch (ex: any) {
+      setErrMsg(ex.message || "Błąd wywołania testu modelu.");
+    } finally {
+      setTestingNow(false);
+    }
   };
+
+  const isAnyBridgeOnline = Boolean(bridgeStatus?.online || browserRelay.active);
 
   return (
     <div className="space-y-6">
       <PageHeader
         title={t.nav.models}
-        subtitle="Dynamiczny rejestr modeli chmurowych (OpenAI, Anthropic, OpenRouter), lokalnych (Ollama) i HTTP z łańcuchami fallback i żywą diagnostyką wnioskowania."
+        subtitle="Dynamiczny rejestr modeli chmurowych (OpenAI, Anthropic, OpenRouter), lokalnych (LM Studio LAN, Ollama) i HTTP z łańcuchami fallback i żywą diagnostyką wnioskowania."
       />
+
+      {errMsg && (
+        <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-3 text-xs text-rose-200">
+          {errMsg}
+        </div>
+      )}
 
       {statusMsg && (
         <div className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 p-3 text-xs text-emerald-200">
@@ -318,62 +361,83 @@ export function ModelsProvidersPage() {
 
       <Card className="border-indigo-500/35 bg-gradient-to-r from-indigo-950/35 via-zinc-950/90 to-emerald-950/20">
         <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="space-y-1">
-            <div className="flex items-center gap-2">
+          <div className="space-y-1.5 max-w-2xl">
+            <div className="flex flex-wrap items-center gap-2">
               <HardDrive className="h-4 w-4 text-indigo-400" />
               <h2 className="text-sm font-semibold text-zinc-100">
                 Most LAN dla Arena Preview (192.168.18.184:1234 ↔ Chmura Arena)
               </h2>
-              <Badge tone={bridgeStatus?.online ? "emerald" : "amber"}>
-                {bridgeStatus?.online
-                  ? `MOST LAN AKTYWNY (${bridgeStatus.endpoint})`
-                  : "OCZEKIWANIE NA MOST LAN"}
+              <Badge tone={isAnyBridgeOnline ? "emerald" : "amber"}>
+                {isAnyBridgeOnline
+                  ? `POŁĄCZONO Z LM STUDIO (${browserRelay.localTarget || bridgeStatus?.endpoint})`
+                  : "OCZEKIWANIE NA POŁĄCZENIE"}
               </Badge>
             </div>
-            <p className="text-xs text-zinc-300">
-              Ponieważ podgląd Arena działa w chmurze, a Twój model{" "}
-              <code className="text-indigo-300">
-                qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive
-              </code>{" "}
-              działa w Twojej sieci domowej (<code>http://192.168.18.184:1234</code>), uruchom
-              na swoim komputerze 1-plikowy most Python (0 zależności) — automatycznie połączy
-              Arena Preview z Twoim LM Studio oraz pobierze świeże dane rynkowe BTC/USD:
+            <p className="text-xs text-zinc-300 leading-relaxed">
+              Domena <code>*.arena.site</code> chroni sesję ciasteczkiem przeglądarki, dlatego most
+              działa dwustopniowo: <b>(1)</b> pobierz/skopiuj nowy skrypt{" "}
+              <code>apex_lan_bridge.py</code> i uruchom <code>python apex_lan_bridge.py</code> na
+              komputerze, a następnie <b>(2)</b> kliknij zielony przycisk{" "}
+              <b>Połącz przeglądarkę z mostem lokalnym</b> (lub włącz <i>Enable CORS</i> w LM Studio na tym samym PC).
             </p>
-            {bridgeStatus?.online && (
+            {isAnyBridgeOnline && (
               <div className="text-xs text-emerald-300">
-                Host: <b>{bridgeStatus.bridge_host || "LAN"}</b> · Modele:{" "}
-                <b>{(bridgeStatus.models || []).join(", ")}</b> · Wykonane zadania LLM:{" "}
-                <b>{bridgeStatus.completed_jobs}</b>
+                Tryb: <b>{browserRelay.active ? `Przekaźnik Przeglądarki (${browserRelay.mode})` : bridgeStatus?.bridge_host}</b>{" "}
+                · Wykryte modele:{" "}
+                <b>{(browserRelay.models.length ? browserRelay.models : bridgeStatus?.models || []).join(", ")}</b>{" "}
+                · Zadania LLM: <b>{Math.max(browserRelay.completedJobs, bridgeStatus?.completed_jobs || 0)}</b>
+                {browserRelay.btcSynced ? " · Snapshot BTC/USD 30D: WGRANY" : ""}
               </div>
             )}
           </div>
           <div className="flex flex-wrap gap-2 text-xs">
             <button
               type="button"
-              onClick={() => void handleDownloadBridgeScript()}
+              onClick={() => void handleCopyBridgeScript()}
               className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-2 font-semibold text-white hover:bg-indigo-500"
             >
               <Download className="h-3.5 w-3.5" />
-              Pobierz apex_lan_bridge.py
+              1. Skopiuj / Pobierz apex_lan_bridge.py
             </button>
             <button
               type="button"
-              onClick={() => void handleCopyBridgeScript()}
-              className="rounded-lg border border-zinc-700 bg-zinc-900 px-3.5 py-2 font-medium text-zinc-200 hover:border-indigo-400/50"
+              onClick={() => void handleConnectBrowserRelay()}
+              className="rounded-lg bg-emerald-600 px-3.5 py-2 font-semibold text-white hover:bg-emerald-500"
             >
-              Pokaż / Skopiuj kod skryptu
+              {browserRelay.active
+                ? "Połączono z LM Studio (Odśwież)"
+                : "2. Połącz przeglądarkę z mostem lokalnym"}
             </button>
+            {typeof window !== "undefined" && window.self !== window.top && (
+              <a
+                href={window.location.href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="rounded-lg border border-amber-400/40 bg-amber-500/10 px-3 py-2 font-medium text-amber-200 hover:bg-amber-500/20"
+              >
+                Otwórz podgląd w pełnej karcie ↗
+              </a>
+            )}
           </div>
         </div>
         {bridgeScriptPreview && (
           <div className="mt-3 space-y-1.5">
-            <div className="text-[11px] text-zinc-400">
-              Zapisz poniższy plik na swoim komputerze jako <code>apex_lan_bridge.py</code> i
-              uruchom w terminalu / PowerShell: <code>python apex_lan_bridge.py</code>
+            <div className="flex items-center justify-between text-[11px] text-zinc-400">
+              <span>
+                Zapisz ten kod jako <code>apex_lan_bridge.py</code> na komputerze i uruchom:{" "}
+                <code>python apex_lan_bridge.py</code>
+              </span>
+              <button
+                type="button"
+                onClick={() => void handleDownloadBridgeScript()}
+                className="text-indigo-300 underline"
+              >
+                Zapisz jako plik .py
+              </button>
             </div>
             <textarea
               readOnly
-              rows={7}
+              rows={8}
               value={bridgeScriptPreview}
               className="w-full rounded-lg border border-zinc-800 bg-zinc-950 p-2.5 font-mono text-[11px] text-zinc-300"
             />
@@ -482,9 +546,10 @@ export function ModelsProvidersPage() {
               </select>
               <button
                 type="submit"
-                className="rounded-lg bg-emerald-600 px-4 py-2 font-semibold text-white hover:bg-emerald-500"
+                disabled={testingNow}
+                className="rounded-lg bg-emerald-600 px-4 py-2 font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
               >
-                Testuj Model
+                {testingNow ? "Testowanie..." : "Testuj Model"}
               </button>
             </div>
             <input

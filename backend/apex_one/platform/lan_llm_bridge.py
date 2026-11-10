@@ -1,21 +1,18 @@
-"""Reverse HTTP Long-Poll LAN LLM Bridge for Cloud Preview Environments.
+"""Reverse HTTP Long-Poll & Browser-Assisted LAN LLM Bridge for Cloud Previews.
 
-When APEX ONE runs inside a cloud preview container (such as Arena Preview on
-``*.e2b.app``) while the user's LLM server runs on their private home/office LAN
-(e.g. LM Studio at ``http://192.168.18.184:1234/v1`` serving
-``qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive``), the cloud container cannot
-initiate TCP connections into the user's private RFC1918 LAN.
+Supports TWO simultaneous transport paths from a cloud preview (such as
+``https://sbx-*.arena.site`` or ``https://*.e2b.app``) to a private LAN LLM
+server (``http://192.168.18.184:1234/v1`` running
+``qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive``):
 
-``LanLLMBridgeBroker`` reverses the connection direction:
-1. A lightweight, zero-dependency Python 3 script (``apex_lan_bridge.py``) runs
-   on the user's machine inside their LAN.
-2. It connects *outbound* over HTTPS to the Arena Preview API
-   (``POST /api/v1/lan-bridge/poll``) and waits for pending inference jobs.
-3. Whenever ``LLMGateway`` needs inference from a local/LAN provider and an
-   active bridge is online for that organization, it dispatches the prompt to
-   the bridge queue, the user's machine executes it locally against
-   ``http://192.168.18.184:1234/v1/chat/completions``, and posts the completion
-   back via ``POST /api/v1/lan-bridge/complete``.
+1. **Direct Python-to-Arena HTTPS Long-Poll** (when the preview URL accepts
+   direct API-key / bearer requests from Python on the user's machine).
+2. **Browser-Assisted Localhost CORS/PNA Relay (`127.0.0.1:18765`)** (when the
+   cloud preview edge proxy requires browser-only auth cookies such as
+   ``*.arena.site``): ``apex_lan_bridge.py`` exposes ``http://127.0.0.1:18765``
+   on the user's PC with full CORS + ``Access-Control-Allow-Private-Network``
+   headers, forwarding to ``http://192.168.18.184:1234/v1``, while the user's
+   authenticated browser tab relays ``/api/v1/lan-bridge/poll`` <-> ``127.0.0.1:18765``.
 """
 
 from __future__ import annotations
@@ -215,17 +212,20 @@ def build_lan_bridge_python_script(
     lmstudio_url: str = "http://192.168.18.184:1234/v1",
     default_model: str = "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
 ) -> str:
-    """Return a standalone, zero-dependency Python 3 bridge script for the user's PC."""
+    """Return a Dual-Mode zero-dependency Python 3 bridge script for the user's PC."""
     clean_arena = arena_base_url.rstrip("/")
     clean_lms = lmstudio_url.rstrip("/")
     return f'''#!/usr/bin/env python3
-"""APEX ONE — Most LAN dla Arena Preview (Zero-Dependency Python 3 Bridge).
+"""APEX ONE — Dual-Mode Most LAN dla Arena Preview (Zero-Dependency Python 3).
 
-Łączy chmurowy podgląd Arena Preview ({clean_arena})
-z lokalnym serwerem LM Studio w sieci LAN ({clean_lms},
-model: {default_model}) oraz opcjonalnie pobiera aktualne dane rynkowe BTC/USD.
+Działa w dwóch trybach jednocześnie, aby zagwarantować 100% łączności z Arena Preview:
+  1. Lokalny przekaźnik CORS/PNA na http://127.0.0.1:18765 -> {clean_lms}
+     (dla Twojej zalogowanej przeglądarki z otwartym Arena Preview — omija blokady cookie *.arena.site!)
+  2. Bezpośredni poller HTTPS do {clean_arena} (jeśli proxy chmurowe wpuszcza ruch CLI).
 
-Uruchomienie na Twoim komputerze (Windows PowerShell / CMD / macOS / Linux):
+Dodatkowo pobiera świeże 90-dniowe / 30-dniowe dane rynkowe Bitcoin (BTC/USD).
+
+Uruchomienie na Twoim komputerze:
     python apex_lan_bridge.py
 """
 
@@ -238,8 +238,10 @@ import socket
 import ssl
 import statistics
 import sys
+import threading
 import time
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -248,8 +250,10 @@ AUTH_TOKEN = {auth_token!r}
 ORG_ID = {organization_id!r}
 DEFAULT_LMS_URL = {clean_lms!r}
 DEFAULT_MODEL = {default_model!r}
+LOCAL_PROXY_PORT = 18765
 
 SSL_CTX = ssl.create_default_context()
+CACHED_BTC_MARKDOWN: dict[str, str] = {{}}
 
 
 def _http_json(url: str, method: str = "GET", payload: dict | None = None, headers: dict | None = None, timeout: float = 30.0) -> dict:
@@ -261,7 +265,10 @@ def _http_json(url: str, method: str = "GET", payload: dict | None = None, heade
     req = Request(url=url, data=data, headers=hdrs, method=method)
     ctx = SSL_CTX if url.startswith("https://") else None
     with urlopen(req, timeout=timeout, context=ctx) as resp:
+        ctype = (resp.headers.get("Content-Type") or "").lower()
         raw = resp.read().decode("utf-8", errors="replace")
+        if "text/html" in ctype or raw.lstrip().startswith("<!DOCTYPE"):
+            raise PermissionError("Arena proxy wymaga sesji przeglądarki (HTML auth gate)")
         return json.loads(raw) if raw.strip() else {{}}
 
 
@@ -276,8 +283,9 @@ def probe_lmstudio(lms_url: str) -> list[str]:
         return []
 
 
-def ingest_live_btc_snapshot(arena_url: str, headers: dict) -> None:
-    """Pobiera rzeczywiste 90-dniowe świece dzienne BTC/USD z publicznego API i rejestruje w APEX ONE."""
+def build_live_btc_markdown() -> dict[str, str] | None:
+    if CACHED_BTC_MARKDOWN:
+        return CACHED_BTC_MARKDOWN
     closes: list[float] = []
     highs: list[float] = []
     lows: list[float] = []
@@ -305,11 +313,11 @@ def ingest_live_btc_snapshot(arena_url: str, headers: dict) -> None:
             highs = list(closes)
             lows = list(closes)
         except Exception as exc:
-            print(f"[INFO] Pominięto automatyczny snapshot BTC/USD ({{exc}}).")
-            return
+            print(f"[INFO] Pominięto pobranie kursu BTC/USD ({{exc}}).")
+            return None
 
     if len(closes) < 32:
-        return
+        return None
 
     spot = closes[-1]
     chg_7d = ((spot / closes[-8]) - 1.0) * 100.0 if len(closes) >= 8 else 0.0
@@ -319,7 +327,6 @@ def ingest_live_btc_snapshot(arena_url: str, headers: dict) -> None:
     ann_vol_pct = daily_vol * math.sqrt(365.0) * 100.0
     vol_30d = daily_vol * math.sqrt(30.0)
 
-    # Empiryczna częstość spadków w ruchomych oknach 30-dniowych z ostatnich 90 dni
     windows = 0
     dd_5 = dd_10 = dd_20 = 0
     for start in range(0, len(closes) - 30):
@@ -337,7 +344,6 @@ def ingest_live_btc_snapshot(arena_url: str, headers: dict) -> None:
     def _norm_cdf(x: float) -> float:
         return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
-    # Prawdopodobieństwo zamknięcia za 30 dni poniżej progu przy zerowym dryfie (neutralny GBM)
     p_close_5 = _norm_cdf((math.log(0.95) + 0.5 * vol_30d * vol_30d) / max(vol_30d, 1e-6)) * 100.0
     p_close_10 = _norm_cdf((math.log(0.90) + 0.5 * vol_30d * vol_30d) / max(vol_30d, 1e-6)) * 100.0
     p_close_20 = _norm_cdf((math.log(0.80) + 0.5 * vol_30d * vol_30d) / max(vol_30d, 1e-6)) * 100.0
@@ -358,22 +364,13 @@ def ingest_live_btc_snapshot(arena_url: str, headers: dict) -> None:
         f"  * Kurs za 30D <= -10% (${{spot*0.90:,.0f}}): {{p_close_10:.1f}}%\\n"
         f"  * Kurs za 30D <= -20% (${{spot*0.80:,.0f}}): {{p_close_20:.1f}}%\\n"
     )
-    try:
-        _http_json(
-            f"{{arena_url}}/api/v1/sources",
-            method="POST",
-            payload={{
-                "source_type": "MD",
-                "title": f"Live BTC/USD Market Telemetry Snapshot ({{now_str}})",
-                "uri_or_filename": "btc_usd_live_30d_telemetry.md",
-                "raw_text": md,
-            }},
-            headers=headers,
-            timeout=10.0,
-        )
-        print(f"[OK] Zarejestrowano świeże dane rynkowe BTC/USD (${{spot:,.2f}}, vol 30D={{ann_vol_pct:.1f}}%) w Rejestrze Źródeł APEX ONE!")
-    except Exception as exc:
-        print(f"[INFO] Nie udało się zapisać snapshotu BTC: {{exc}}")
+    CACHED_BTC_MARKDOWN.update({{
+        "title": f"Live BTC/USD Market Telemetry Snapshot ({{now_str}})",
+        "markdown": md,
+        "spot_usd": f"{{spot:,.2f}}",
+    }})
+    print(f"[OK] Pobrano świeży kurs BTC/USD: ${{spot:,.2f}} (zmienność 30D={{ann_vol_pct:.1f}}%)")
+    return CACHED_BTC_MARKDOWN
 
 
 def call_lmstudio(lms_url: str, job: dict) -> dict:
@@ -414,83 +411,186 @@ def call_lmstudio(lms_url: str, job: dict) -> dict:
     }}
 
 
+def make_local_cors_handler(lms_url: str):
+    host_name = socket.gethostname()
+
+    class _LocalRelayHandler(BaseHTTPRequestHandler):
+        def _send_cors(self, status: int = 200) -> None:
+            origin = self.headers.get("Origin") or "*"
+            self.send_response(status)
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "*")
+            self.send_header("Access-Control-Allow-Private-Network", "true")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+
+        def do_OPTIONS(self) -> None:  # noqa: N802
+            self._send_cors(204)
+            self.end_headers()
+
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path.startswith("/health"):
+                models = probe_lmstudio(lms_url)
+                body = json.dumps({{
+                    "ok": True,
+                    "endpoint": lms_url,
+                    "host": host_name,
+                    "models": models or [DEFAULT_MODEL],
+                }}).encode("utf-8")
+                self._send_cors(200)
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path.startswith("/btc-snapshot"):
+                snap = build_live_btc_markdown() or {{}}
+                body = json.dumps(snap).encode("utf-8")
+                self._send_cors(200)
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self._send_cors(404)
+            self.end_headers()
+            self.wfile.write(b'{{"error":"not_found"}}')
+
+        def do_POST(self) -> None:  # noqa: N802
+            if self.path.startswith("/infer"):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length).decode("utf-8", errors="replace")
+                job = json.loads(raw) if raw else {{}}
+                jid = job.get("job_id", "browser")
+                req_model = job.get("model") or DEFAULT_MODEL
+                print(f"[PRZEGLĄDARKA -> LM STUDIO {{jid}}] {{req_model}} ...", end=" ", flush=True)
+                try:
+                    result = call_lmstudio(lms_url, job)
+                    print(f"OK ({{result['latency_ms']}} ms, {{result['total_tokens']}} tok)")
+                except Exception as exc:
+                    print(f"BŁĄD: {{exc}}")
+                    result = {{"error": str(exc)}}
+                body = json.dumps(result).encode("utf-8")
+                self._send_cors(200)
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self._send_cors(404)
+            self.end_headers()
+            self.wfile.write(b'{{"error":"not_found"}}')
+
+        def log_message(self, fmt: str, *args) -> None:
+            return
+
+    return _LocalRelayHandler
+
+
+def direct_https_poller(arena_url: str, lms_url: str, headers: dict, models: list[str], sync_btc: bool) -> None:
+    host_name = socket.gethostname()
+    if sync_btc:
+        snap = build_live_btc_markdown()
+        if snap:
+            try:
+                _http_json(
+                    f"{{arena_url.rstrip('/')}}/api/v1/sources",
+                    method="POST",
+                    payload={{
+                        "source_type": "MD",
+                        "title": snap["title"],
+                        "uri_or_filename": "btc_usd_live_30d_telemetry.md",
+                        "raw_text": snap["markdown"],
+                    }},
+                    headers=headers,
+                    timeout=10.0,
+                )
+                print("[OK] Wgrano snapshot BTC/USD bezpośrednio do Arena Preview!")
+            except Exception:
+                pass
+
+    while True:
+        try:
+            poll_resp = _http_json(
+                f"{{arena_url.rstrip('/')}}/api/v1/lan-bridge/poll",
+                method="POST",
+                payload={{
+                    "endpoint": lms_url,
+                    "models": models or [DEFAULT_MODEL],
+                    "bridge_host": host_name,
+                }},
+                headers=headers,
+                timeout=22.0,
+            )
+            job = poll_resp.get("job")
+            if not job:
+                continue
+            jid = job["job_id"]
+            req_model = job.get("model") or DEFAULT_MODEL
+            print(f"[ZADANIE HTTPS {{jid}}] {{req_model}} ...", end=" ", flush=True)
+            try:
+                result = call_lmstudio(lms_url, job)
+                print(f"OK ({{result['latency_ms']}} ms, {{result['total_tokens']}} tok)")
+            except Exception as exc:
+                print(f"BŁĄD: {{exc}}")
+                result = {{"error": str(exc)}}
+            _http_json(
+                f"{{arena_url.rstrip('/')}}/api/v1/lan-bridge/complete",
+                method="POST",
+                payload={{"job_id": jid, "result": result}},
+                headers=headers,
+                timeout=15.0,
+            )
+        except PermissionError:
+            print("[TRYB PRZEGLĄDARKOWY] Proxy *.arena.site wymaga cookie przeglądarki — użyj przycisku 'Połącz z lokalnym mostem (127.0.0.1:18765)' w karcie Modele i Dostawcy!")
+            return
+        except HTTPError as exc:
+            if exc.code in (401, 403):
+                print(f"[TRYB PRZEGLĄDARKOWY] HTTP {{exc.code}} na połączeniu bezpośrednim — używam lokalnego portu http://127.0.0.1:{{LOCAL_PROXY_PORT}} dla Twojej przeglądarki!")
+                return
+            time.sleep(3.0)
+        except Exception:
+            time.sleep(3.0)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="APEX ONE Reverse LAN Bridge for Arena Preview")
-    parser.add_argument("--arena-url", default=ARENA_URL, help="Adres URL Arena Preview")
-    parser.add_argument("--lms-url", default=DEFAULT_LMS_URL, help="Adres lokalnego LM Studio (/v1)")
-    parser.add_argument("--no-btc", action="store_true", help="Pomiń pobranie świeżego kursu BTC/USD przy starcie")
+    parser = argparse.ArgumentParser(description="APEX ONE Dual-Mode LAN Bridge")
+    parser.add_argument("--arena-url", default=ARENA_URL)
+    parser.add_argument("--lms-url", default=DEFAULT_LMS_URL)
+    parser.add_argument("--port", type=int, default=LOCAL_PROXY_PORT)
+    parser.add_argument("--no-btc", action="store_true")
     args = parser.parse_args()
+
+    print("=" * 74)
+    print(" APEX ONE — Dual-Mode Most LAN dla Arena Preview")
+    print(f" Lokalny przekaźnik dla przeglądarki : http://127.0.0.1:{{args.port}}")
+    print(f" Docelowy serwer LM Studio w LAN     : {{args.lms_url}}")
+    print(f" Model docelowy                      : {{DEFAULT_MODEL}}")
+    print("=" * 74)
+
+    models = probe_lmstudio(args.lms_url)
+    if models:
+        print(f"[OK] Połączono z LM Studio! Dostępne modele: {{', '.join(models)}}")
+    else:
+        print(f"[!] Nie wykryto jeszcze odpowiedzi spod {{args.lms_url}} — upewnij się, że serwer LM Studio działa na porcie 1234.")
+
+    if not args.no_btc:
+        build_live_btc_markdown()
 
     headers = {{
         "X-Apex-Session-Token": AUTH_TOKEN,
         "Authorization": f"Bearer {{AUTH_TOKEN}}",
         "X-Organization-Id": ORG_ID,
     }}
-    host_name = socket.gethostname()
-    print("=" * 72)
-    print(" APEX ONE — Most LAN dla Arena Preview")
-    print(f" Arena Preview : {{args.arena_url}}")
-    print(f" LM Studio LAN : {{args.lms_url}}")
-    print(f" Domyślny model: {{DEFAULT_MODEL}}")
-    print("=" * 72)
+    t = threading.Thread(
+        target=direct_https_poller,
+        args=(args.arena_url, args.lms_url, headers, models, not args.no_btc),
+        daemon=True,
+    )
+    t.start()
 
-    models = probe_lmstudio(args.lms_url)
-    if models:
-        print(f"[OK] Wykryto modele w LM Studio ({{len(models)}}): {{', '.join(models)}}")
-    else:
-        print(f"[!] Upewnij się, że LM Studio nasłuchuje pod {{args.lms_url}} (włącz Local Server na porcie 1234).")
-
-    if not args.no_btc:
-        ingest_live_btc_snapshot(args.arena_url, headers)
-
-    print("[GOTOWY] Most LAN jest AKTYWNY! Wróć do przeglądarki (Arena Preview) i uruchom przebieg 8 agentów (Ctrl+C aby zakończyć).")
-
-    while True:
-        try:
-            poll_resp = _http_json(
-                f"{{args.arena_url.rstrip('/')}}/api/v1/lan-bridge/poll",
-                method="POST",
-                payload={{
-                    "endpoint": args.lms_url,
-                    "models": models or [DEFAULT_MODEL],
-                    "bridge_host": host_name,
-                }},
-                headers=headers,
-                timeout=25.0,
-            )
-            job = poll_resp.get("job")
-            if not job:
-                continue
-
-            jid = job["job_id"]
-            req_model = job.get("model") or DEFAULT_MODEL
-            print(f"[ZADANIE {{jid}}] Wykonywanie wnioskowania na {{req_model}} ...", end=" ", flush=True)
-            try:
-                result = call_lmstudio(args.lms_url, job)
-                print(f"OK ({{result['latency_ms']}} ms, {{result['total_tokens']}} tok)")
-            except Exception as exc:
-                print(f"BŁĄD: {{exc}}")
-                result = {{"error": str(exc)}}
-
-            _http_json(
-                f"{{args.arena_url.rstrip('/')}}/api/v1/lan-bridge/complete",
-                method="POST",
-                payload={{"job_id": jid, "result": result}},
-                headers=headers,
-                timeout=15.0,
-            )
-        except KeyboardInterrupt:
-            print("\\n[STOP] Zatrzymano most LAN.")
-            sys.exit(0)
-        except HTTPError as exc:
-            print(f"[HTTP {{exc.code}}] Problem autoryzacji lub połączenia z Arena Preview: {{exc}}")
-            time.sleep(3.0)
-        except URLError as exc:
-            print(f"[SIEĆ] Ponawianie połączenia z Arena Preview ({{exc}})...")
-            time.sleep(2.5)
-        except Exception as exc:
-            print(f"[BŁĄD] {{exc}}")
-            time.sleep(2.0)
+    srv = ThreadingHTTPServer(("127.0.0.1", args.port), make_local_cors_handler(args.lms_url))
+    print(f"[GOTOWY] Nasłuchuję na http://127.0.0.1:{{args.port}} — kliknij 'Połącz przeglądarkę z mostem lokalnym' w Arena Preview (Ctrl+C aby zakończyć).")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\\n[STOP] Zatrzymano most LAN.")
+        sys.exit(0)
 
 
 if __name__ == "__main__":

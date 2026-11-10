@@ -11,9 +11,11 @@ Mounts:
 
 from __future__ import annotations
 
+import os
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,11 +38,16 @@ def create_app(
     cfg = settings or get_settings()
     container = build_app_container(cfg, seed_demo=seed_demo, max_rpm=max_rpm)
 
+    local_state_env = os.environ.get("APEX_LOCAL_STATE_FILE", "").strip()
+    local_state_path = Path(local_state_env) if local_state_env else None
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.container = container
         if seed_demo:
             await container.platform_persistence.hydrate_or_seed(container.platform)
+            if not container.platform_persistence.active and local_state_path is not None:
+                container.platform.load_local_checkpoint(local_state_path)
         yield
         await container.cache_adapter.close()
         await container.db_adapter.dispose()
@@ -55,11 +62,12 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.container = container
+    app.state.local_state_path = local_state_path
 
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cfg.cors_origins_list,
-        allow_origin_regex=r"^https://[0-9]+-[a-zA-Z0-9-]+\.e2b\.app$",
+        allow_origin_regex=r"^https://[a-zA-Z0-9-]+\.(e2b\.app|arena\.site)$",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -95,13 +103,15 @@ def create_app(
 
         response = await call_next(request)  # type: ignore[operator]
         if (
-            c.platform_persistence.active
-            and request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            request.method in {"POST", "PUT", "PATCH", "DELETE"}
             and request.url.path.startswith("/api/v1/")
             and not request.url.path.startswith("/api/v1/lan-bridge/")
             and 200 <= response.status_code < 300
         ):
-            await c.platform_persistence.sync_to_postgres(c.platform)
+            if c.platform_persistence.active:
+                await c.platform_persistence.sync_to_postgres(c.platform)
+            elif local_state_path is not None:
+                c.platform.save_local_checkpoint(local_state_path)
         response.headers["X-Request-ID"] = req_id
         response.headers["X-RateLimit-Remaining"] = str(remaining)
         return response  # type: ignore[no-any-return]

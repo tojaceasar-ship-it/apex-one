@@ -92,6 +92,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     void refreshProfile();
+    const onExpired = () => {
+      setUser(null);
+      setLoading(false);
+    };
+    window.addEventListener("apex:session-expired", onExpired);
+    return () => window.removeEventListener("apex:session-expired", onExpired);
   }, [refreshProfile]);
 
   const loginWithCredentials = async (email: string, password: string) => {

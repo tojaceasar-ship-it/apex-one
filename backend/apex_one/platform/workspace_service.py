@@ -142,6 +142,75 @@ class ApexPlatformService:
         if seed_demo:
             self._bootstrap_workspace_and_demo()
 
+    _CHECKPOINT_FIELDS: tuple[str, ...] = (
+        "users",
+        "users_by_email",
+        "organizations",
+        "memberships",
+        "invitations",
+        "sessions_by_hash",
+        "api_credentials",
+        "devices",
+        "agents",
+        "agent_versions",
+        "agent_teams",
+        "agent_runs",
+        "tools_catalog",
+        "projects",
+        "questions",
+        "briefs",
+        "plans",
+        "hypotheses",
+        "reports",
+        "sources",
+        "source_snapshots",
+        "claims",
+        "evidence",
+        "memories",
+        "memory_chunks",
+        "datasets",
+        "dataset_versions",
+        "experiments",
+        "experiment_runs",
+        "eval_suites",
+        "eval_cases",
+        "eval_runs",
+        "eval_scores",
+        "regressions",
+        "workflow_defs",
+        "workflow_runs_store",
+        "approvals",
+        "budgets",
+        "usage_records",
+        "model_providers",
+        "extensions",
+        "default_org_id",
+    )
+
+    def save_local_checkpoint(self, file_path: Path) -> None:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        payload: dict[str, Any] = {
+            k: getattr(self, k) for k in self._CHECKPOINT_FIELDS
+        }
+        payload["_audit_events"] = list(self.audit._events)
+        tmp = file_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(file_path)
+
+    def load_local_checkpoint(self, file_path: Path) -> bool:
+        if not file_path.exists():
+            return False
+        try:
+            payload = json.loads(file_path.read_text(encoding="utf-8"))
+            for k in self._CHECKPOINT_FIELDS:
+                if k in payload:
+                    setattr(self, k, payload[k])
+            if "_audit_events" in payload:
+                self.audit._events = list(payload["_audit_events"])
+            return True
+        except Exception:
+            return False
+
     # =========================================================================
     # IDENTITY, AUTHENTICATION & STRICT MULTI-TENANT AUTHORIZATION
     # =========================================================================

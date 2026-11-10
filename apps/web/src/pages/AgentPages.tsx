@@ -647,9 +647,10 @@ export function RunsExecutionsPage() {
   const [modelId, setModelId] = useState("qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive");
   const [projId, setProjId] = useState("");
   const [simulateInterrupt, setSimulateInterrupt] = useState(false);
-  const [asyncExec, setAsyncExec] = useState(false);
+  const [asyncExec, setAsyncExec] = useState(true);
   const [autoDiscover, setAutoDiscover] = useState(false);
   const [streamEvents, setStreamEvents] = useState<string[]>([]);
+  const [runErr, setRunErr] = useState<string | null>(null);
 
   const load = async () => {
     const [r, p] = await Promise.all([
@@ -709,22 +710,27 @@ export function RunsExecutionsPage() {
 
   const handleLaunch = async (e: React.FormEvent) => {
     e.preventDefault();
-    const created = await apiFetch("/api/v1/runs", {
-      method: "POST",
-      body: JSON.stringify({
-        objective,
-        execution_mode: mode,
-        research_project_id: projId || null,
-        interrupt_after_step: simulateInterrupt ? 3 : null,
-        model_identifier: modelId,
-        async_execution: asyncExec && !simulateInterrupt,
-        auto_discover_sources: autoDiscover,
-      }),
-    });
-    setObjective("");
-    await load();
-    if (asyncExec && !simulateInterrupt && created?.id) {
-      void handleReplaySse(created.id);
+    setRunErr(null);
+    try {
+      const created = await apiFetch("/api/v1/runs", {
+        method: "POST",
+        body: JSON.stringify({
+          objective,
+          execution_mode: mode,
+          research_project_id: projId || null,
+          interrupt_after_step: simulateInterrupt ? 3 : null,
+          model_identifier: modelId,
+          async_execution: asyncExec && !simulateInterrupt,
+          auto_discover_sources: autoDiscover,
+        }),
+      });
+      setObjective("");
+      await load();
+      if (asyncExec && !simulateInterrupt && created?.id) {
+        void handleReplaySse(created.id);
+      }
+    } catch (ex: any) {
+      setRunErr(ex.message || "Nie udało się uruchomić przebiegu.");
     }
   };
 
@@ -744,6 +750,12 @@ export function RunsExecutionsPage() {
         title={t.nav.runs}
         subtitle="Trwała orkiestracja DAG z punktami kontrolnymi niezależnymi od kontekstu rozmowy, wykonaniem w tle i strumieniem SSE na żywo."
       />
+
+      {runErr && (
+        <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-3 text-xs text-rose-200">
+          {runErr}
+        </div>
+      )}
 
       <Card>
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
