@@ -644,8 +644,11 @@ export function RunsExecutionsPage() {
   const [projects, setProjects] = useState<any[]>([]);
   const [objective, setObjective] = useState("");
   const [mode, setMode] = useState<"multi_agent_team" | "single_agent">("multi_agent_team");
+  const [modelId, setModelId] = useState("apex-analytical-local-v1");
   const [projId, setProjId] = useState("");
   const [simulateInterrupt, setSimulateInterrupt] = useState(false);
+  const [asyncExec, setAsyncExec] = useState(false);
+  const [autoDiscover, setAutoDiscover] = useState(false);
   const [streamEvents, setStreamEvents] = useState<string[]>([]);
 
   const load = async () => {
@@ -661,19 +664,68 @@ export function RunsExecutionsPage() {
     void load();
   }, [scope]);
 
+  const handleReplaySse = async (runId: string) => {
+    setStreamEvents([]);
+    const sess = loadStoredSession();
+    const res = await fetch(`/api/v1/runs/${runId}/stream`, {
+      credentials: "include",
+      headers: {
+        "X-Apex-Session-Token": sess.token || "",
+        Authorization: sess.token ? `Bearer ${sess.token}` : "",
+        "X-Organization-Id": sess.organizationId || "",
+      },
+    });
+    if (!res.body) {
+      const text = await res.text();
+      const lines = text
+        .split("\n")
+        .filter((l) => l.startsWith("data: "))
+        .map((l) => l.slice(6));
+      setStreamEvents(lines);
+      return;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() || "";
+      for (const frame of parts) {
+        const dataLine = frame
+          .split("\n")
+          .find((l) => l.startsWith("data: "));
+        if (dataLine) {
+          const rawJson = dataLine.slice(6);
+          setStreamEvents((prev) => [...prev, rawJson]);
+        }
+      }
+      await load();
+    }
+    await load();
+  };
+
   const handleLaunch = async (e: React.FormEvent) => {
     e.preventDefault();
-    await apiFetch("/api/v1/runs", {
+    const created = await apiFetch("/api/v1/runs", {
       method: "POST",
       body: JSON.stringify({
         objective,
         execution_mode: mode,
         research_project_id: projId || null,
         interrupt_after_step: simulateInterrupt ? 3 : null,
+        model_identifier: modelId,
+        async_execution: asyncExec && !simulateInterrupt,
+        auto_discover_sources: autoDiscover,
       }),
     });
     setObjective("");
     await load();
+    if (asyncExec && !simulateInterrupt && created?.id) {
+      void handleReplaySse(created.id);
+    }
   };
 
   const handleResume = async (runId: string) => {
@@ -686,30 +738,11 @@ export function RunsExecutionsPage() {
     await load();
   };
 
-  const handleReplaySse = async (runId: string) => {
-    setStreamEvents([]);
-    const sess = loadStoredSession();
-    const res = await fetch(`/api/v1/runs/${runId}/stream`, {
-      credentials: "include",
-      headers: {
-        "X-Apex-Session-Token": sess.token || "",
-        Authorization: sess.token ? `Bearer ${sess.token}` : "",
-        "X-Organization-Id": sess.organizationId || "",
-      },
-    });
-    const text = await res.text();
-    const lines = text
-      .split("\n")
-      .filter((l) => l.startsWith("data: "))
-      .map((l) => l.slice(6));
-    setStreamEvents(lines);
-  };
-
   return (
     <div className="space-y-6">
       <PageHeader
         title={t.nav.runs}
-        subtitle="Trwała orkiestracja DAG z punktami kontrolnymi niezależnymi od kontekstu rozmowy, idempotentnym rejestrem narzędzi i strumieniem SSE."
+        subtitle="Trwała orkiestracja DAG z punktami kontrolnymi niezależnymi od kontekstu rozmowy, wykonaniem w tle i strumieniem SSE na żywo."
       />
 
       <Card>
@@ -717,7 +750,7 @@ export function RunsExecutionsPage() {
           Uruchom Nowy Przebieg Badawczy
         </h2>
         <form onSubmit={handleLaunch} className="space-y-3 text-xs">
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
             <input
               required
               value={objective}
@@ -738,6 +771,17 @@ export function RunsExecutionsPage() {
               </option>
             </select>
             <select
+              value={modelId}
+              onChange={(e) => setModelId(e.target.value)}
+              className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-zinc-100"
+            >
+              <option value="apex-analytical-local-v1">APEX Analytical v1 (Auto / Fallback)</option>
+              <option value="gpt-4.1-mini">OpenAI · gpt-4.1-mini</option>
+              <option value="claude-sonnet-4-0">Anthropic · claude-sonnet-4-0</option>
+              <option value="openrouter/auto">OpenRouter · auto</option>
+              <option value="llama3.2">Ollama Local · llama3.2</option>
+            </select>
+            <select
               value={projId}
               onChange={(e) => setProjId(e.target.value)}
               className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-zinc-100"
@@ -751,14 +795,32 @@ export function RunsExecutionsPage() {
             </select>
           </div>
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <label className="flex items-center gap-2 text-zinc-300">
-              <input
-                type="checkbox"
-                checked={simulateInterrupt}
-                onChange={(e) => setSimulateInterrupt(e.target.checked)}
-              />
-              Przerwij celowo po kroku 3 (test trwałego punktu kontrolnego i idempotentnego wznowienia)
-            </label>
+            <div className="flex flex-wrap items-center gap-4">
+              <label className="flex items-center gap-2 text-zinc-300">
+                <input
+                  type="checkbox"
+                  checked={asyncExec}
+                  onChange={(e) => setAsyncExec(e.target.checked)}
+                />
+                Asynchroniczne wykonanie w tle + strumień SSE na żywo
+              </label>
+              <label className="flex items-center gap-2 text-zinc-300">
+                <input
+                  type="checkbox"
+                  checked={autoDiscover}
+                  onChange={(e) => setAutoDiscover(e.target.checked)}
+                />
+                Automatyczne odkrywanie literatury (Source Scout)
+              </label>
+              <label className="flex items-center gap-2 text-zinc-300">
+                <input
+                  type="checkbox"
+                  checked={simulateInterrupt}
+                  onChange={(e) => setSimulateInterrupt(e.target.checked)}
+                />
+                Przerwij celowo po kroku 3 (test wznowienia)
+              </label>
+            </div>
             <button
               type="submit"
               className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 font-semibold text-white hover:bg-indigo-500"

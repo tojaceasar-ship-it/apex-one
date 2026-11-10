@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from apex_one.platform.governance import GovernanceBlockedError, ImmutableAuditError
 from apex_one.platform.research_engine import InvalidResearchStateTransitionError
+from apex_one.platform.scientific_connectors import SSRFBlockedError
 from apex_one.platform.workspace_service import (
     ApexPlatformService,
     AuthorizationError,
@@ -104,6 +105,34 @@ class LaunchRunBody(BaseModel):
     agent_id: str | None = None
     team_id: str | None = None
     interrupt_after_step: int | None = None
+    model_identifier: str = "apex-analytical-local-v1"
+    async_execution: bool = False
+    auto_discover_sources: bool = False
+
+
+class FetchUrlSourceBody(BaseModel):
+    url: str = Field(min_length=8)
+    research_project_id: str | None = None
+    title_override: str | None = None
+
+
+class DiscoverSourcesBody(BaseModel):
+    query: str = Field(min_length=2)
+    connectors: list[str] = Field(
+        default_factory=lambda: ["openalex", "arxiv", "crossref", "github"]
+    )
+    max_per_connector: int = Field(default=5, ge=1, le=20)
+    auto_register_project_id: str | None = None
+
+
+class ConfigureProviderSecretBody(BaseModel):
+    api_key: str = ""
+    base_url: str | None = None
+
+
+class TestProviderInferenceBody(BaseModel):
+    model_identifier: str = "gpt-4.1-mini"
+    prompt: str = "Summarize empirical verification principles in two sentences."
 
 
 class CreateProjectBody(BaseModel):
@@ -348,6 +377,11 @@ def create_platform_router(get_platform: Any) -> APIRouter:
             raise HTTPException(
                 status_code=422,
                 detail={"code": "INVALID_STATE_TRANSITION", "message": str(exc)},
+            ) from exc
+        except SSRFBlockedError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "SSRF_BLOCKED", "message": str(exc)},
             ) from exc
         except ValueError as exc:
             raise HTTPException(
@@ -635,18 +669,50 @@ def create_platform_router(get_platform: Any) -> APIRouter:
 
     @router.post("/runs", status_code=201)
     async def launch_run(
-        body: LaunchRunBody, ctx: dict[str, Any] = Depends(require_auth_context)
+        request: Request,
+        body: LaunchRunBody,
+        ctx: dict[str, Any] = Depends(require_auth_context),
     ) -> dict[str, Any]:
-        return handle_domain_call(
-            lambda: ctx["svc"].launch_agent_run(
-                user_id=ctx["user_id"],
+        container = request.app.state.container
+        if body.async_execution:
+            queued = handle_domain_call(
+                lambda: ctx["svc"].enqueue_async_run(
+                    user_id=ctx["user_id"],
+                    organization_id=ctx["organization_id"],
+                    objective=body.objective,
+                    execution_mode=body.execution_mode,
+                    research_project_id=body.research_project_id,
+                    agent_id=body.agent_id,
+                    team_id=body.team_id,
+                    model_identifier=body.model_identifier,
+                    auto_discover_sources=body.auto_discover_sources,
+                )
+            )
+            container.async_runner.schedule_run(
+                svc=ctx["svc"],
+                persistence=container.platform_persistence
+                if container.platform_persistence.active
+                else None,
                 organization_id=ctx["organization_id"],
-                objective=body.objective,
-                execution_mode=body.execution_mode,
-                research_project_id=body.research_project_id,
-                agent_id=body.agent_id,
-                team_id=body.team_id,
-                interrupt_after_step=body.interrupt_after_step,
+                user_id=ctx["user_id"],
+                run_id=queued["id"],
+            )
+            return queued
+
+        return await asyncio.to_thread(
+            lambda: handle_domain_call(
+                lambda: ctx["svc"].launch_agent_run(
+                    user_id=ctx["user_id"],
+                    organization_id=ctx["organization_id"],
+                    objective=body.objective,
+                    execution_mode=body.execution_mode,
+                    research_project_id=body.research_project_id,
+                    agent_id=body.agent_id,
+                    team_id=body.team_id,
+                    interrupt_after_step=body.interrupt_after_step,
+                    model_identifier=body.model_identifier,
+                    auto_discover_sources=body.auto_discover_sources,
+                )
             )
         )
 
@@ -676,40 +742,57 @@ def create_platform_router(get_platform: Any) -> APIRouter:
 
     @router.get("/runs/{run_id}/stream")
     async def stream_run_progress(
-        run_id: str, ctx: dict[str, Any] = Depends(require_auth_context)
+        request: Request,
+        run_id: str,
+        ctx: dict[str, Any] = Depends(require_auth_context),
     ) -> StreamingResponse:
         svc: ApexPlatformService = ctx["svc"]
-        run_rec = handle_domain_call(
+        container = request.app.state.container
+        handle_domain_call(
             lambda: svc._require_org_entity(
                 svc.agent_runs, run_id, ctx["organization_id"], "AgentRun"
             )
         )
 
         async def event_gen() -> Any:
-            for step in run_rec.get("steps", []):
-                payload = json.dumps(
-                    {
-                        "type": "step",
-                        "run_id": run_id,
-                        "step_index": step["step_index"],
-                        "agent_name": step["agent_name"],
-                        "status": step["status"],
-                        "tokens_used": step["tokens_used"],
-                    }
-                )
-                yield f"event: step\ndata: {payload}\n\n"
-                await asyncio.sleep(0.01)
-            done = json.dumps(
-                {
-                    "type": "complete",
-                    "run_id": run_id,
-                    "status": run_rec["status"],
-                    "progress_pct": run_rec["progress_pct"],
-                }
-            )
-            yield f"event: complete\ndata: {done}\n\n"
+            async for ev in container.async_runner.stream_events(
+                svc=svc, run_id=run_id
+            ):
+                kind = ev.get("event", "step.completed")
+                if kind == "step.completed":
+                    payload = json.dumps(
+                        {
+                            "type": "step",
+                            "run_id": run_id,
+                            "step_index": ev["step_index"],
+                            "agent_name": ev["agent"],
+                            "role": ev.get("role", ""),
+                            "task": ev.get("task", ""),
+                            "status": ev["status"],
+                            "tokens_used": ev["tokens_used"],
+                            "live_llm_invoked": ev.get("live_llm_invoked", False),
+                        }
+                    )
+                    yield f"event: step\ndata: {payload}\n\n"
+                elif kind in {"run.completed", "run.cancelled", "run.failed"}:
+                    latest = svc.agent_runs.get(run_id, {})
+                    done = json.dumps(
+                        {
+                            "type": "complete",
+                            "run_id": run_id,
+                            "status": ev.get("status", latest.get("status", "COMPLETED")),
+                            "progress_pct": latest.get("progress_pct", 100),
+                            "tokens_used": ev.get("tokens_used", latest.get("tokens_used", 0)),
+                            "cost_usd": ev.get("cost_usd", latest.get("cost_usd", 0.0)),
+                        }
+                    )
+                    yield f"event: complete\ndata: {done}\n\n"
 
-        return StreamingResponse(event_gen(), media_type="text/event-stream")
+        return StreamingResponse(
+            event_gen(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @router.get("/research/projects")
     async def list_projects(
@@ -837,6 +920,39 @@ def create_platform_router(get_platform: Any) -> APIRouter:
             )
         )
 
+    @router.post("/sources/fetch-url", status_code=201)
+    async def fetch_url_source(
+        body: FetchUrlSourceBody, ctx: dict[str, Any] = Depends(require_auth_context)
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            lambda: handle_domain_call(
+                lambda: ctx["svc"].fetch_and_register_url_source(
+                    user_id=ctx["user_id"],
+                    organization_id=ctx["organization_id"],
+                    url=body.url,
+                    research_project_id=body.research_project_id,
+                    title_override=body.title_override,
+                )
+            )
+        )
+
+    @router.post("/sources/discover")
+    async def discover_sources(
+        body: DiscoverSourcesBody, ctx: dict[str, Any] = Depends(require_auth_context)
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            lambda: handle_domain_call(
+                lambda: ctx["svc"].discover_sources(
+                    user_id=ctx["user_id"],
+                    organization_id=ctx["organization_id"],
+                    query=body.query,
+                    connectors=body.connectors,
+                    max_per_connector=body.max_per_connector,
+                    auto_register_project_id=body.auto_register_project_id,
+                )
+            )
+        )
+
     @router.post("/evidence/claims", status_code=201)
     async def create_claim(
         body: CreateClaimBody, ctx: dict[str, Any] = Depends(require_auth_context)
@@ -915,23 +1031,49 @@ def create_platform_router(get_platform: Any) -> APIRouter:
 
     @router.get("/memories/search")
     async def search_memories(
+        request: Request,
         q: str = Query(..., min_length=1),
         memory_type: str | None = Query(default=None),
         project_id: str | None = Query(default=None),
         top_k: int = Query(default=8, ge=1, le=30),
         ctx: dict[str, Any] = Depends(require_auth_context),
     ) -> dict[str, Any]:
+        svc: ApexPlatformService = ctx["svc"]
+        org_id: str = ctx["organization_id"]
+        container = request.app.state.container
+        if container.platform_persistence.active:
+            q_vec, backend_name = await asyncio.to_thread(
+                lambda: svc.llm_gateway.embed_text_1536_with_live_provider(
+                    q,
+                    organization_id=org_id,
+                    providers_catalog=svc.model_providers.get(org_id, []),
+                )
+            )
+            pg_hits = await container.platform_persistence.pgvector_hybrid_search(
+                organization_id=org_id,
+                query=q,
+                query_embedding=q_vec,
+                memory_type=memory_type,
+                project_id=project_id,
+                top_k=top_k,
+            )
+            return {
+                "query": q,
+                "search_engine": f"postgresql_pgvector+{backend_name}",
+                "results": pg_hits,
+            }
+
         hits = handle_domain_call(
-            lambda: ctx["svc"].search_memories(
+            lambda: svc.search_memories(
                 user_id=ctx["user_id"],
-                organization_id=ctx["organization_id"],
+                organization_id=org_id,
                 query=q,
                 memory_type=memory_type,
                 project_id=project_id,
                 top_k=top_k,
             )
         )
-        return {"query": q, "results": hits}
+        return {"query": q, "search_engine": "in_process_hybrid", "results": hits}
 
     @router.post("/memories/{memory_id}/action")
     async def memory_action(
@@ -1086,6 +1228,38 @@ def create_platform_router(get_platform: Any) -> APIRouter:
                 user_id=ctx["user_id"],
                 organization_id=ctx["organization_id"],
                 payload=body.model_dump(),
+            )
+        )
+
+    @router.post("/models/providers/{provider_slug}/secret")
+    async def configure_provider_secret(
+        provider_slug: str,
+        body: ConfigureProviderSecretBody,
+        ctx: dict[str, Any] = Depends(require_auth_context),
+    ) -> dict[str, Any]:
+        return handle_domain_call(
+            lambda: ctx["svc"].configure_model_provider_secret(
+                user_id=ctx["user_id"],
+                organization_id=ctx["organization_id"],
+                provider_slug=provider_slug,
+                api_key=body.api_key,
+                base_url=body.base_url,
+            )
+        )
+
+    @router.post("/models/test-inference")
+    async def test_provider_inference(
+        body: TestProviderInferenceBody,
+        ctx: dict[str, Any] = Depends(require_auth_context),
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            lambda: handle_domain_call(
+                lambda: ctx["svc"].test_model_provider_inference(
+                    user_id=ctx["user_id"],
+                    organization_id=ctx["organization_id"],
+                    model_identifier=body.model_identifier,
+                    prompt=body.prompt,
+                )
             )
         )
 

@@ -78,6 +78,9 @@ class DurableCheckpointRuntimeAdapter:
         agents_lookup: dict[str, dict[str, Any]],
         project_sources: list[dict[str, Any]],
         interrupt_after_step: int | None = None,
+        llm_gateway: Any | None = None,
+        organization_id: str | None = None,
+        providers_catalog: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         t0 = time.perf_counter()
         mode = run_record.get("execution_mode", "multi_agent_team")
@@ -503,6 +506,61 @@ class DurableCheckpointRuntimeAdapter:
                     "report_chars": len(md),
                     "linked_claims": len(claims_list),
                 }
+
+            # Invoke live LLM provider (OpenAI / Anthropic / OpenRouter / Ollama) when configured
+            if (
+                llm_gateway is not None
+                and organization_id
+                and providers_catalog
+                and run_record.get("model_identifier", "apex-analytical-local-v1")
+                != "deterministic-only"
+            ):
+                agent_spec = agents_lookup.get(slug, {})
+                dna = agent_spec.get("dna") or {}
+                sys_inst = str(
+                    dna.get("instructions")
+                    or f"You are specialist research agent '{slug}'."
+                )
+                src_digest = "\n".join(
+                    f"- [{s['id'][:8]}] {s['title']}: {str(s.get('extracted_text') or '')[:320]}"
+                    for s in project_sources[:6]
+                )
+                user_msg = (
+                    f"Research Objective: {objective}\n"
+                    f"Current Specialist Step ({s_idx}): {step['task_title']}\n"
+                    f"Primary Sources:\n{src_digest or '(no external sources attached)'}\n"
+                    "Provide a concise, evidence-grounded analytical output."
+                )
+                llm_res = llm_gateway.complete_sync(
+                    organization_id=organization_id,
+                    providers_catalog=providers_catalog,
+                    preferred_model=str(
+                        run_record.get("model_identifier")
+                        or "apex-analytical-local-v1"
+                    ),
+                    system_prompt=sys_inst,
+                    user_prompt=user_msg,
+                )
+                if llm_res is not None and llm_res.live_llm_invoked:
+                    step_tokens = llm_res.total_tokens
+                    step_cost = llm_res.cost_usd
+                    out_meta = dict(step.get("output_json") or {})
+                    out_meta.update(
+                        {
+                            "live_llm_invoked": True,
+                            "provider_used": llm_res.provider_slug,
+                            "model_used": llm_res.model_identifier,
+                            "fallback_triggered": llm_res.fallback_triggered,
+                            "llm_reasoning": llm_res.content[:2000],
+                        }
+                    )
+                    step["output_json"] = out_meta
+                    if slug in {"research-writer", "universal-baseline"} and llm_res.content:
+                        artifacts_acc["report_markdown"] = (
+                            f"{artifacts_acc.get('report_markdown', '')}\n\n"
+                            f"## Synteza Modelu ({llm_res.provider_slug}/{llm_res.model_identifier})\n\n"
+                            f"{llm_res.content}"
+                        ).strip()
 
             step["duration_ms"] = max(2, int((time.perf_counter() - step_start) * 1000))
             step["tokens_used"] = step_tokens

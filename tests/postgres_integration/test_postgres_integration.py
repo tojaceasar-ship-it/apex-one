@@ -12,10 +12,12 @@ import pytest
 
 from apex_one.db.adapter import PostgresConnectionAdapter
 from apex_one.db.models import DEFAULT_EMBEDDING_DIM, KnowledgeChunk, ResearchProject, Tenant
+from apex_one.db.platform_persistence import PostgresPlatformPersistence
 from apex_one.db.repositories import SqlAlchemyWorkflowStore
 from apex_one.db.vector import search_knowledge_chunks
 from apex_one.outbox.models import OutboxEnqueueRequest
 from apex_one.outbox.queue import PostgresOutboxQueue
+from apex_one.platform.workspace_service import ApexPlatformService
 
 pytestmark = pytest.mark.pg_integration
 
@@ -106,3 +108,71 @@ async def test_transactional_workflow_and_skip_locked_outbox(
     assert job_id in claimed_ids
     for c in claimed:
         await queue.mark_succeeded(job_id=c.id, worker_id="pg-worker-1")
+
+
+async def test_platform_persistence_cold_restart_pgvector_and_rls_isolation(
+    real_postgres_adapter: PostgresConnectionAdapter,
+) -> None:
+    """Verify full ApexPlatformService persistence, cold restart hydration,
+    pgvector hybrid search, and cross-tenant RLS isolation on real PostgreSQL 16."""
+    svc1 = ApexPlatformService(seed_demo=True)
+    persistence1 = PostgresPlatformPersistence(real_postgres_adapter)
+    active = await persistence1.hydrate_or_seed(svc1)
+    assert active is True
+
+    login = svc1.login(email="admin@apex-one.local", password="ApexResearch!2026")
+    uid = login["user"]["id"]
+    oid = login["active_organization_id"]
+
+    marker = f"PG16-Durability-{uuid.uuid4().hex[:8]}"
+    proj = svc1.create_research_project(
+        user_id=uid,
+        organization_id=oid,
+        title=f"Durable Study {marker}",
+        hypothesis="PostgreSQL + pgvector + RLS survives cold restart.",
+    )
+    mem = svc1.create_memory_object(
+        user_id=uid,
+        organization_id=oid,
+        memory_type="finding",
+        title=f"Finding {marker}",
+        content=f"Empirical pgvector persistence marker {marker} confirmed.",
+        source_ref="pg://durability-test",
+        project_id=proj["id"],
+    )
+    await persistence1.sync_to_postgres(svc1)
+
+    # Simulate cold process restart with empty in-memory service
+    svc2 = ApexPlatformService(seed_demo=False)
+    persistence2 = PostgresPlatformPersistence(real_postgres_adapter)
+    rehydrated = await persistence2.hydrate_or_seed(svc2)
+    assert rehydrated is True
+
+    assert proj["id"] in svc2.projects
+    assert svc2.projects[proj["id"]]["title"] == f"Durable Study {marker}"
+    assert mem["id"] in svc2.memories
+    audit_check = svc2.audit.verify_chain(oid)
+    assert audit_check["valid"] is True
+
+    # Native PostgreSQL pgvector `<=>` hybrid search under RLS
+    q_vec, _ = svc2.llm_gateway.embed_text_1536_with_live_provider(
+        marker, organization_id=oid, providers_catalog=[]
+    )
+    pg_hits = await persistence2.pgvector_hybrid_search(
+        organization_id=oid,
+        query=marker,
+        query_embedding=q_vec,
+        top_k=5,
+    )
+    assert any(marker in h["content"] for h in pg_hits)
+
+    # Foreign tenant cannot read org's memory_chunks via RLS
+    foreign_org = str(uuid.uuid4())
+    foreign_hits = await persistence2.pgvector_hybrid_search(
+        organization_id=foreign_org,
+        query=marker,
+        query_embedding=q_vec,
+        top_k=5,
+    )
+    assert foreign_hits == []
+

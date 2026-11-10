@@ -116,6 +116,19 @@ def build_local_node_router(registry: LocalNodeGatewayRegistry) -> APIRouter:
                             },
                         }
                     )
+                elif method == "task.result":
+                    params = dict(frame.get("params") or {})
+                    await websocket.send_json(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": msg_id,
+                            "result": {
+                                "acknowledged": True,
+                                "node_id": state.node_id,
+                                "task_id": params.get("task_id"),
+                            },
+                        }
+                    )
                 elif method == "node.disconnect":
                     state.status = "OFFLINE"
                     await websocket.send_json(

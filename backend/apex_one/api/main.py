@@ -39,6 +39,8 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.container = container
+        if seed_demo:
+            await container.platform_persistence.hydrate_or_seed(container.platform)
         yield
         await container.cache_adapter.close()
         await container.db_adapter.dispose()
@@ -92,6 +94,13 @@ def create_app(
             )
 
         response = await call_next(request)  # type: ignore[operator]
+        if (
+            c.platform_persistence.active
+            and request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            and request.url.path.startswith("/api/v1/")
+            and 200 <= response.status_code < 300
+        ):
+            await c.platform_persistence.sync_to_postgres(c.platform)
         response.headers["X-Request-ID"] = req_id
         response.headers["X-RateLimit-Remaining"] = str(remaining)
         return response  # type: ignore[no-any-return]

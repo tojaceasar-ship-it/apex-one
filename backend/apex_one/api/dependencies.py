@@ -10,6 +10,7 @@ from fastapi import Header, HTTPException, Request
 from apex_one.cache.redis_adapter import CacheAdapter, build_cache_adapter
 from apex_one.config import Settings, get_settings
 from apex_one.db.adapter import PostgresConnectionAdapter
+from apex_one.db.platform_persistence import PostgresPlatformPersistence
 from apex_one.db.repositories import (
     KnowledgeVectorStoreProtocol,
     SqlAlchemyKnowledgeVectorStore,
@@ -20,6 +21,7 @@ from apex_one.local_node_gateway.protocol import (
     DEFAULT_DEV_NODE_SECRET,
     LocalNodeGatewayRegistry,
 )
+from apex_one.platform.async_runner import AsyncRunCoordinator
 from apex_one.platform.security import SlidingWindowRateLimiter
 from apex_one.platform.workspace_service import ApexPlatformService
 from apex_one.sandbox.adapter import ExperimentSandboxAdapter, build_sandbox_adapter
@@ -35,6 +37,8 @@ class AppContainer:
     sandbox_adapter: ExperimentSandboxAdapter
     local_node_registry: LocalNodeGatewayRegistry
     platform: ApexPlatformService
+    platform_persistence: PostgresPlatformPersistence
+    async_runner: AsyncRunCoordinator
     rate_limiter: SlidingWindowRateLimiter
 
 
@@ -63,6 +67,8 @@ def build_app_container(
             arena_isolated_mode=cfg.arena_isolated_mode,
         ),
         platform=ApexPlatformService(seed_demo=seed_demo),
+        platform_persistence=PostgresPlatformPersistence(db_adapter),
+        async_runner=AsyncRunCoordinator(),
         rate_limiter=SlidingWindowRateLimiter(
             max_requests=max_rpm, window_seconds=60
         ),

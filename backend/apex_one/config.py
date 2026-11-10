@@ -16,7 +16,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 EnvironmentProfile = Literal["development", "staging", "production"]
 PoolMode = Literal["pooled", "nullpool"]
-SandboxProviderType = Literal["none", "external_http", "e2b", "modal"]
+SandboxProviderType = Literal[
+    "none", "external_http", "e2b", "modal", "rootless_container"
+]
 
 DEV_PLACEHOLDER_SECRET = "dev-only-insecure-secret-do-not-use-in-prod-0000"
 

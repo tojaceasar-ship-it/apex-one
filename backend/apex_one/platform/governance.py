@@ -133,6 +133,34 @@ class TamperEvidentAuditLedger:
         chain = self._entries_by_org.get(organization_id, [])
         return list(reversed(chain[-limit:]))
 
+    def get_chronological_entries(self, organization_id: str) -> list[AuditEntry]:
+        return list(self._entries_by_org.get(organization_id, []))
+
+    def hydrate_org_entries(
+        self,
+        organization_id: str,
+        raw_entries: list[dict[str, Any]],
+    ) -> None:
+        ordered = sorted(raw_entries, key=lambda r: int(r["sequence_no"]))
+        self._entries_by_org[organization_id] = [
+            AuditEntry(
+                id=str(r["id"]),
+                organization_id=str(r["organization_id"]),
+                sequence_no=int(r["sequence_no"]),
+                actor_id=str(r["actor_id"]),
+                actor_type=str(r["actor_type"]),
+                action=str(r["action"]),
+                resource_type=str(r["resource_type"]),
+                resource_id=str(r["resource_id"]),
+                risk_level=r["risk_level"],
+                details=dict(r.get("details") or {}),
+                prev_hash=str(r["prev_hash"]),
+                entry_hash=str(r["entry_hash"]),
+                created_at=str(r["created_at"]),
+            )
+            for r in ordered
+        ]
+
     def modify_entry(self, *_args: object, **_kwargs: object) -> None:
         raise ImmutableAuditError(
             "Audit records are append-only and protected from modification."

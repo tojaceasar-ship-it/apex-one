@@ -1133,3 +1133,27 @@ class ExtensionRecord(Base, OrgScopedMixin):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, server_default=func.now(), nullable=False
     )
+
+
+class PlatformIdentityDirectoryRecord(Base, TimestampMixin):
+    __tablename__ = "platform_identity_directory"
+
+    singleton_key: Mapped[str] = mapped_column(String(48), primary_key=True)
+    identity_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
+
+
+class OrganizationWorkspaceStateRecord(Base, TimestampMixin):
+    __tablename__ = "organization_workspace_states"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        primary_key=True,
+        nullable=False,
+    )
+    state_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
+

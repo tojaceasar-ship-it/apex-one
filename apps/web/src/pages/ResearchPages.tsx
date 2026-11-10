@@ -782,6 +782,9 @@ export function SourceRegistryPage() {
   const [contentBase64, setContentBase64] = useState<string | null>(null);
   const [projectId, setProjectId] = useState("");
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [liveUrl, setLiveUrl] = useState("");
+  const [scholarQuery, setScholarQuery] = useState("");
+  const [discovered, setDiscovered] = useState<any[]>([]);
 
   const load = async () => {
     const [s, p] = await Promise.all([
@@ -844,11 +847,58 @@ export function SourceRegistryPage() {
     await load();
   };
 
+  const handleFetchUrl = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setFeedback(null);
+    try {
+      const res = await apiFetch("/api/v1/sources/fetch-url", {
+        method: "POST",
+        body: JSON.stringify({
+          url: liveUrl,
+          research_project_id: projectId || null,
+        }),
+      });
+      setFeedback(
+        `Pobrano i zweryfikowano stronę URL '${res.title}' (SHA-256: ${res.checksum_sha256.slice(0, 12)}...).`
+      );
+      setLiveUrl("");
+      await load();
+    } catch (ex: any) {
+      setFeedback(`Błąd pobierania URL: ${ex.message}`);
+    }
+  };
+
+  const handleDiscoverLiterature = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setFeedback(null);
+    try {
+      const res = await apiFetch("/api/v1/sources/discover", {
+        method: "POST",
+        body: JSON.stringify({
+          query: scholarQuery,
+          connectors: ["openalex", "arxiv", "crossref", "github"],
+          max_per_connector: 4,
+          auto_register_project_id: projectId || null,
+        }),
+      });
+      setDiscovered(res.results || []);
+      const statuses = Object.entries(res.connector_statuses || {})
+        .map(([k, v]) => `${k}: ${v}`)
+        .join(" · ");
+      setFeedback(
+        `Wyszukiwanie zakończone (${res.total_found} publikacji/repozytoriów; zaimportowano: ${(res.registered_sources || []).length}). Status konektorów: ${statuses}`
+      );
+      await load();
+    } catch (ex: any) {
+      setFeedback(`Błąd wyszukiwania: ${ex.message}`);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <PageHeader
         title={t.nav.sources}
-        subtitle="Rejestr źródeł pierwotnych (URL, PDF, DOCX, TXT, MD) z kontrolą duplikatów SHA-256 i ochroną przed Prompt Injection."
+        subtitle="Rejestr źródeł pierwotnych (URL, PDF, DOCX, TXT, MD), konektory literatury naukowej (OpenAlex, arXiv, Crossref, GitHub) i ochrona SSRF/Prompt Injection."
       />
 
       {feedback && (
@@ -856,6 +906,63 @@ export function SourceRegistryPage() {
           {feedback}
         </div>
       )}
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <Card>
+          <h2 className="mb-2 text-sm font-semibold text-zinc-100">
+            Konektory Literatury Naukowej (OpenAlex · arXiv · Crossref · GitHub)
+          </h2>
+          <form onSubmit={handleDiscoverLiterature} className="flex gap-2 text-xs">
+            <input
+              required
+              value={scholarQuery}
+              onChange={(e) => setScholarQuery(e.target.value)}
+              placeholder="Zapytanie naukowe (np. multi-agent verification rag)..."
+              className="flex-1 rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-zinc-100"
+            />
+            <button
+              type="submit"
+              className="rounded-lg bg-indigo-600 px-4 py-2 font-semibold text-white hover:bg-indigo-500"
+            >
+              Szukaj Źródeł
+            </button>
+          </form>
+          {discovered.length > 0 && (
+            <div className="mt-3 max-h-40 space-y-1.5 overflow-y-auto text-xs">
+              {discovered.map((d, idx) => (
+                <div
+                  key={idx}
+                  className="rounded border border-zinc-800 bg-zinc-950/70 px-2.5 py-1.5 text-zinc-300"
+                >
+                  <span className="font-semibold text-indigo-300">[{d.connector}]</span>{" "}
+                  {d.title}
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+
+        <Card>
+          <h2 className="mb-2 text-sm font-semibold text-zinc-100">
+            Pobieranie URL na Żywo (SSRF-Safe HTML/PDF Snapshot)
+          </h2>
+          <form onSubmit={handleFetchUrl} className="flex gap-2 text-xs">
+            <input
+              required
+              value={liveUrl}
+              onChange={(e) => setLiveUrl(e.target.value)}
+              placeholder="https://github.com/... lub artykuł badawczy..."
+              className="flex-1 rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-zinc-100"
+            />
+            <button
+              type="submit"
+              className="rounded-lg bg-emerald-600 px-4 py-2 font-semibold text-white hover:bg-emerald-500"
+            >
+              Pobierz URL
+            </button>
+          </form>
+        </Card>
+      </div>
 
       <Card>
         <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-zinc-100">

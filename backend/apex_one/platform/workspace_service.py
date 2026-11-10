@@ -12,7 +12,6 @@ from __future__ import annotations
 import csv
 import io
 import json
-import os
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timedelta
@@ -38,10 +37,10 @@ from apex_one.platform.governance import (
     compute_approval_parameter_hash,
     default_approval_expiry,
 )
+from apex_one.platform.llm_gateway import LLMGateway
 from apex_one.platform.memory_and_docs import (
     VALID_MEMORY_TYPES,
     chunk_document_text,
-    embed_text_1536,
     extract_document_text,
     rank_memory_chunks,
 )
@@ -56,6 +55,10 @@ from apex_one.platform.research_engine import (
     build_evidence_graph_topology,
     evaluate_claim_evidence_status,
     validate_research_state_transition,
+)
+from apex_one.platform.scientific_connectors import (
+    discover_scientific_literature,
+    fetch_and_extract_url_source,
 )
 from apex_one.platform.security import (
     ROLE_PERMISSIONS,
@@ -82,6 +85,7 @@ class ApexPlatformService:
     def __init__(self, *, repo_root: Path | None = None, seed_demo: bool = True) -> None:
         self._repo_root = repo_root or Path(__file__).resolve().parents[3]
         self._runtime = DurableCheckpointRuntimeAdapter()
+        self.llm_gateway = LLMGateway()
         self.audit = TamperEvidentAuditLedger()
 
         # Multi-tenant state stores keyed cleanly with mandatory organization_id checks
@@ -707,6 +711,8 @@ class ApexPlatformService:
         team_id: str | None = None,
         interrupt_after_step: int | None = None,
         workspace_scope: str = "research",
+        model_identifier: str = "apex-analytical-local-v1",
+        auto_discover_sources: bool = False,
     ) -> dict[str, Any]:
         self.authorize(
             user_id=user_id,
@@ -715,6 +721,131 @@ class ApexPlatformService:
         )
         self._enforce_operational_guards(organization_id)
 
+        if auto_discover_sources:
+            self.auto_ingest_discovered_sources(
+                user_id=user_id,
+                organization_id=organization_id,
+                query=objective,
+                research_project_id=research_project_id,
+                workspace_scope=workspace_scope,
+            )
+
+        initial_run = self._create_initial_run_record(
+            organization_id=organization_id,
+            objective=objective,
+            execution_mode=execution_mode,
+            research_project_id=research_project_id,
+            agent_id=agent_id,
+            team_id=team_id,
+            workspace_scope=workspace_scope,
+            model_identifier=model_identifier,
+        )
+        run_id = initial_run["id"]
+        project_sources, agents_by_slug = self._resolve_run_context(
+            organization_id=organization_id,
+            research_project_id=research_project_id,
+        )
+
+        completed_run = self._runtime.execute_or_resume_run(
+            run_record=initial_run,
+            agents_lookup=agents_by_slug,
+            project_sources=project_sources,
+            interrupt_after_step=interrupt_after_step,
+            llm_gateway=self.llm_gateway,
+            organization_id=organization_id,
+            providers_catalog=self.model_providers.get(organization_id, []),
+        )
+        self.agent_runs[run_id] = completed_run
+        self._persist_run_side_effects(completed_run, user_id=user_id)
+        return completed_run
+
+    def enqueue_async_run(
+        self,
+        *,
+        user_id: str,
+        organization_id: str,
+        objective: str,
+        execution_mode: str = "multi_agent_team",
+        research_project_id: str | None = None,
+        agent_id: str | None = None,
+        team_id: str | None = None,
+        workspace_scope: str = "research",
+        model_identifier: str = "apex-analytical-local-v1",
+        auto_discover_sources: bool = False,
+    ) -> dict[str, Any]:
+        self.authorize(
+            user_id=user_id,
+            organization_id=organization_id,
+            required_permission="agents:run",
+        )
+        self._enforce_operational_guards(organization_id)
+        if auto_discover_sources:
+            self.auto_ingest_discovered_sources(
+                user_id=user_id,
+                organization_id=organization_id,
+                query=objective,
+                research_project_id=research_project_id,
+                workspace_scope=workspace_scope,
+            )
+        initial_run = self._create_initial_run_record(
+            organization_id=organization_id,
+            objective=objective,
+            execution_mode=execution_mode,
+            research_project_id=research_project_id,
+            agent_id=agent_id,
+            team_id=team_id,
+            workspace_scope=workspace_scope,
+            model_identifier=model_identifier,
+        )
+        initial_run["status"] = "RUNNING"
+        self.agent_runs[initial_run["id"]] = initial_run
+        return initial_run
+
+    def advance_run_one_step(
+        self,
+        *,
+        organization_id: str,
+        user_id: str,
+        run_id: str,
+        step_limit: int,
+        total_steps: int,
+    ) -> dict[str, Any]:
+        run_rec = self._require_org_entity(
+            self.agent_runs, run_id, organization_id, "AgentRun"
+        )
+        project_sources, agents_by_slug = self._resolve_run_context(
+            organization_id=organization_id,
+            research_project_id=run_rec.get("research_project_id"),
+        )
+        stop_after = step_limit if step_limit < total_steps else None
+        advanced = self._runtime.execute_or_resume_run(
+            run_record=run_rec,
+            agents_lookup=agents_by_slug,
+            project_sources=project_sources,
+            interrupt_after_step=stop_after,
+            llm_gateway=self.llm_gateway,
+            organization_id=organization_id,
+            providers_catalog=self.model_providers.get(organization_id, []),
+        )
+        if stop_after is not None and advanced["status"] == "INTERRUPTED":
+            advanced["status"] = "RUNNING"
+        self.agent_runs[run_id] = advanced
+        if advanced["status"] == "COMPLETED":
+            self._persist_run_side_effects(advanced, user_id=user_id)
+        return advanced
+
+    def _create_initial_run_record(
+        self,
+        *,
+        organization_id: str,
+        objective: str,
+        execution_mode: str,
+        research_project_id: str | None,
+        agent_id: str | None,
+        team_id: str | None,
+        workspace_scope: str,
+        model_identifier: str,
+    ) -> dict[str, Any]:
         run_id = str(uuid.uuid4())
         now = utcnow().isoformat()
         agent_ver = None
@@ -723,24 +854,7 @@ class ApexPlatformService:
             if ag["status"] != "active":
                 raise ValueError("Cannot launch run on inactive or archived agent.")
             agent_ver = ag["current_version"]
-
-        project_sources = [
-            s
-            for s in self.sources.values()
-            if s["organization_id"] == organization_id
-            and (
-                research_project_id is None
-                or s.get("research_project_id") == research_project_id
-            )
-        ]
-
-        agents_by_slug = {
-            a["slug"]: a
-            for a in self.agents.values()
-            if a["organization_id"] == organization_id
-        }
-
-        initial_run = {
+        return {
             "id": run_id,
             "organization_id": organization_id,
             "research_project_id": research_project_id,
@@ -748,6 +862,7 @@ class ApexPlatformService:
             "agent_version": agent_ver,
             "team_id": team_id,
             "execution_mode": execution_mode,
+            "model_identifier": model_identifier,
             "runtime_adapter": self._runtime.adapter_name,
             "objective": objective,
             "status": "RUNNING",
@@ -766,15 +881,29 @@ class ApexPlatformService:
             "created_at": now,
         }
 
-        completed_run = self._runtime.execute_or_resume_run(
-            run_record=initial_run,
-            agents_lookup=agents_by_slug,
-            project_sources=project_sources,
-            interrupt_after_step=interrupt_after_step,
-        )
-        self.agent_runs[run_id] = completed_run
-        self._persist_run_side_effects(completed_run, user_id=user_id)
-        return completed_run
+    def _resolve_run_context(
+        self,
+        *,
+        organization_id: str,
+        research_project_id: str | None,
+    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+        project_sources = [
+            s
+            for s in self.sources.values()
+            if s["organization_id"] == organization_id
+            and (
+                research_project_id is None
+                or s.get("research_project_id") == research_project_id
+            )
+        ]
+        agents_by_slug: dict[str, dict[str, Any]] = {}
+        for a in self.agents.values():
+            if a["organization_id"] != organization_id:
+                continue
+            vers = self.agent_versions.get(a["id"], [])
+            latest_dna = vers[-1]["dna_json"] if vers else {}
+            agents_by_slug[a["slug"]] = {**a, "dna": latest_dna}
+        return project_sources, agents_by_slug
 
     def resume_interrupted_agent_run(
         self, *, user_id: str, organization_id: str, run_id: str
@@ -791,25 +920,18 @@ class ApexPlatformService:
         if run_rec["status"] not in {"INTERRUPTED", "FAILED"}:
             return run_rec
 
-        project_sources = [
-            s
-            for s in self.sources.values()
-            if s["organization_id"] == organization_id
-            and (
-                run_rec.get("research_project_id") is None
-                or s.get("research_project_id") == run_rec.get("research_project_id")
-            )
-        ]
-        agents_by_slug = {
-            a["slug"]: a
-            for a in self.agents.values()
-            if a["organization_id"] == organization_id
-        }
+        project_sources, agents_by_slug = self._resolve_run_context(
+            organization_id=organization_id,
+            research_project_id=run_rec.get("research_project_id"),
+        )
         resumed = self._runtime.execute_or_resume_run(
             run_record=run_rec,
             agents_lookup=agents_by_slug,
             project_sources=project_sources,
             interrupt_after_step=None,
+            llm_gateway=self.llm_gateway,
+            organization_id=organization_id,
+            providers_catalog=self.model_providers.get(organization_id, []),
         )
         self.agent_runs[run_id] = resumed
         self._persist_run_side_effects(resumed, user_id=user_id)
@@ -1174,6 +1296,108 @@ class ApexPlatformService:
             and (project_id is None or s.get("research_project_id") == project_id)
             and (scope in {None, "all"} or s["workspace_scope"] == scope)
         ]
+
+    def fetch_and_register_url_source(
+        self,
+        *,
+        user_id: str,
+        organization_id: str,
+        url: str,
+        research_project_id: str | None = None,
+        title_override: str | None = None,
+        workspace_scope: str = "research",
+    ) -> dict[str, Any]:
+        """Fetch remote URL via SSRF-safe HTTP client, sanitize, snapshot SHA-256 & index."""
+        self.authorize(
+            user_id=user_id,
+            organization_id=organization_id,
+            required_permission="sources:write",
+        )
+        fetched = fetch_and_extract_url_source(url)
+        return self.register_source(
+            user_id=user_id,
+            organization_id=organization_id,
+            source_type="URL",
+            title=title_override or fetched["title"],
+            uri_or_filename=fetched["final_url"],
+            raw_text=fetched["extracted_text"],
+            research_project_id=research_project_id,
+            metadata_json={
+                "live_fetched": True,
+                "content_type": fetched["content_type"],
+                "byte_size": fetched["byte_size"],
+                "raw_checksum_sha256": fetched["checksum_sha256"],
+            },
+            workspace_scope=workspace_scope,
+        )
+
+    def discover_sources(
+        self,
+        *,
+        user_id: str,
+        organization_id: str,
+        query: str,
+        connectors: list[str] | None = None,
+        max_per_connector: int = 5,
+        auto_register_project_id: str | None = None,
+        workspace_scope: str = "research",
+    ) -> dict[str, Any]:
+        """Search external scientific literature APIs and optionally register into project."""
+        self.authorize(user_id=user_id, organization_id=organization_id)
+        discovery = discover_scientific_literature(
+            query=query,
+            connectors=connectors,
+            max_per_connector=max_per_connector,
+        )
+        registered: list[dict[str, Any]] = []
+        if auto_register_project_id:
+            self.authorize(
+                user_id=user_id,
+                organization_id=organization_id,
+                required_permission="sources:write",
+            )
+            for item in discovery["results"]:
+                if not item.get("abstract"):
+                    continue
+                src = self.register_source(
+                    user_id=user_id,
+                    organization_id=organization_id,
+                    source_type="URL",
+                    title=item["title"],
+                    uri_or_filename=item["url"] or f"https://scholar.local/{item['connector']}",
+                    raw_text=f"{item['title']}\n\n{item['abstract']}",
+                    research_project_id=auto_register_project_id,
+                    authors=item.get("authors", []),
+                    published_at=item.get("published_at"),
+                    metadata_json={
+                        "connector": item["connector"],
+                        "doi": item.get("doi"),
+                        "citation_count": item.get("citation_count", 0),
+                    },
+                    workspace_scope=workspace_scope,
+                )
+                registered.append(src)
+        return {**discovery, "registered_sources": registered}
+
+    def auto_ingest_discovered_sources(
+        self,
+        *,
+        user_id: str,
+        organization_id: str,
+        query: str,
+        research_project_id: str | None,
+        workspace_scope: str = "research",
+    ) -> list[dict[str, Any]]:
+        res = self.discover_sources(
+            user_id=user_id,
+            organization_id=organization_id,
+            query=query,
+            connectors=["arxiv", "openalex", "github"],
+            max_per_connector=3,
+            auto_register_project_id=research_project_id,
+            workspace_scope=workspace_scope,
+        )
+        return list(res.get("registered_sources", []))
 
     def create_claim_and_evidence(
         self,
@@ -1810,17 +2034,115 @@ class ApexPlatformService:
         providers = self.model_providers.get(organization_id, [])
         enriched: list[dict[str, Any]] = []
         for p in providers:
-            env_key = p.get("auth_env_var")
-            configured = True if not env_key else bool(os.environ.get(env_key, "").strip())
+            configured = self.llm_gateway.has_credentials(organization_id, p)
             status = (
                 "READY_LOCAL_DETERMINISTIC"
                 if p["slug"] == "apex-analytical"
                 else ("CONFIGURED" if configured else "UNCONFIGURED_MISSING_KEY")
             )
-            if p["category"] == "local_ollama" and not os.environ.get("APEX_OLLAMA_URL"):
+            if p["category"] == "local_ollama" and not configured:
                 status = "OFFLINE_IN_ARENA_SANDBOX"
             enriched.append({**p, "credentials_present": configured, "health_status": status})
         return enriched
+
+    def configure_model_provider_secret(
+        self,
+        *,
+        user_id: str,
+        organization_id: str,
+        provider_slug: str,
+        api_key: str,
+        base_url: str | None = None,
+    ) -> dict[str, Any]:
+        self.authorize(
+            user_id=user_id,
+            organization_id=organization_id,
+            required_permission="models:manage",
+        )
+        providers = self.model_providers.get(organization_id, [])
+        alias_map = {
+            "openai": "openai-compatible-cloud",
+            "anthropic": "anthropic-cloud",
+            "ollama": "ollama-local",
+        }
+        resolved_slug = alias_map.get(provider_slug, provider_slug)
+        target = next(
+            (p for p in providers if p["slug"] in {provider_slug, resolved_slug}),
+            None,
+        )
+        if target is None:
+            raise ResourceNotFoundError(f"Model provider '{provider_slug}' not found.")
+        canonical_slug = str(target["slug"])
+        if base_url:
+            target["base_url"] = base_url.strip()
+        meta = self.llm_gateway.set_runtime_secret(
+            organization_id=organization_id,
+            provider_slug=canonical_slug,
+            api_key=api_key,
+        )
+        self.audit.append(
+            organization_id=organization_id,
+            actor_id=user_id,
+            actor_type="user",
+            action="models.configure_secret",
+            resource_type="model_provider",
+            resource_id=target["id"],
+            risk_level="R2",
+            details={"provider_slug": canonical_slug, "configured": meta["configured"]},
+        )
+        return {
+            "provider_slug": canonical_slug,
+            "credentials_present": self.llm_gateway.has_credentials(organization_id, target),
+            "health_status": "CONFIGURED"
+            if self.llm_gateway.has_credentials(organization_id, target)
+            else "UNCONFIGURED_MISSING_KEY",
+        }
+
+    def test_model_provider_inference(
+        self,
+        *,
+        user_id: str,
+        organization_id: str,
+        model_identifier: str,
+        prompt: str = "Summarize empirical verification principles in two sentences.",
+    ) -> dict[str, Any]:
+        self.authorize(
+            user_id=user_id,
+            organization_id=organization_id,
+            required_permission="models:manage",
+        )
+        providers = self.model_providers.get(organization_id, [])
+        res = self.llm_gateway.complete_sync(
+            organization_id=organization_id,
+            providers_catalog=providers,
+            preferred_model=model_identifier,
+            system_prompt="You are APEX ONE verification diagnostics.",
+            user_prompt=prompt,
+        )
+        if res is None:
+            return {
+                "live_llm_invoked": False,
+                "provider_slug": "apex-analytical",
+                "model_identifier": "apex-analytical-local-v1",
+                "content": (
+                    "Deterministic local analytical fallback active — configure an API key "
+                    "or Ollama endpoint to enable external live inference."
+                ),
+                "total_tokens": 0,
+                "cost_usd": 0.0,
+                "latency_ms": 1,
+                "fallback_triggered": True,
+            }
+        return {
+            "live_llm_invoked": res.live_llm_invoked,
+            "provider_slug": res.provider_slug,
+            "model_identifier": res.model_identifier,
+            "content": res.content,
+            "total_tokens": res.total_tokens,
+            "cost_usd": res.cost_usd,
+            "latency_ms": res.latency_ms,
+            "fallback_triggered": res.fallback_triggered,
+        }
 
     def register_model_provider(
         self, *, user_id: str, organization_id: str, payload: dict[str, Any]
@@ -2450,18 +2772,28 @@ class ApexPlatformService:
 
     def _index_memory_chunks(self, mem: dict[str, Any]) -> None:
         raw_chunks = chunk_document_text(mem["content"])
+        org_id = mem["organization_id"]
+        providers = self.model_providers.get(org_id, [])
         built: list[dict[str, Any]] = []
         for idx, ch_text in enumerate(raw_chunks):
+            vec, backend_name = self.llm_gateway.embed_text_1536_with_live_provider(
+                ch_text,
+                organization_id=org_id,
+                providers_catalog=providers,
+            )
             built.append(
                 {
                     "id": str(uuid.uuid4()),
                     "memory_id": mem["id"],
-                    "organization_id": mem["organization_id"],
+                    "organization_id": org_id,
                     "chunk_index": idx,
                     "content": ch_text,
-                    "embedding": embed_text_1536(ch_text),
+                    "embedding": vec,
                     "source_citation": f"{mem['source_ref']}#chunk-{idx + 1}",
-                    "metadata": mem.get("metadata", {}),
+                    "metadata": {
+                        **(mem.get("metadata") or {}),
+                        "embedding_backend": backend_name,
+                    },
                 }
             )
         self.memory_chunks[mem["id"]] = built

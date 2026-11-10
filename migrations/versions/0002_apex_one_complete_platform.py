@@ -40,6 +40,13 @@ MIGRATION_0001_TABLES = frozenset(
     }
 )
 
+MIGRATION_0003_TABLES = frozenset(
+    {
+        "platform_identity_directory",
+        "organization_workspace_states",
+    }
+)
+
 
 def upgrade() -> None:
     # Add organization_id, workspace_scope, state, version columns to research_projects
@@ -75,6 +82,7 @@ def upgrade() -> None:
         table
         for table in Base.metadata.sorted_tables
         if table.name not in MIGRATION_0001_TABLES
+        and table.name not in MIGRATION_0003_TABLES
     ]
     for table in new_tables:
         op.execute(sa.schema.CreateTable(table))
@@ -101,6 +109,7 @@ def downgrade() -> None:
         table
         for table in reversed(Base.metadata.sorted_tables)
         if table.name not in MIGRATION_0001_TABLES
+        and table.name not in MIGRATION_0003_TABLES
     ]
     for table in new_tables:
         op.drop_table(table.name)

@@ -168,6 +168,15 @@ export function ModelsProvidersPage() {
   const [slug, setSlug] = useState("");
   const [name, setName] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
+  const [secretSlug, setSecretSlug] = useState("openai-compatible-cloud");
+  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [overrideBaseUrl, setOverrideBaseUrl] = useState("");
+  const [testModel, setTestModel] = useState("gpt-4.1-mini");
+  const [testPrompt, setTestPrompt] = useState(
+    "Podsumuj w dwóch zdaniach znaczenie niezależnej weryfikacji źródeł pierwotnych."
+  );
+  const [testResult, setTestResult] = useState<any>(null);
+  const [statusMsg, setStatusMsg] = useState<string | null>(null);
 
   const load = async () => {
     const res = await apiFetch("/api/v1/models/providers");
@@ -196,12 +205,47 @@ export function ModelsProvidersPage() {
     await load();
   };
 
+  const handleSaveSecret = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setStatusMsg(null);
+    const res = await apiFetch(`/api/v1/models/providers/${secretSlug}/secret`, {
+      method: "POST",
+      body: JSON.stringify({
+        api_key: apiKeyInput,
+        base_url: overrideBaseUrl || null,
+      }),
+    });
+    setApiKeyInput("");
+    setStatusMsg(
+      `Zaktualizowano poświadczenia dostawcy '${res.provider_slug}' (${res.health_status}). Klucz nie jest nigdy zwracany w API.`
+    );
+    await load();
+  };
+
+  const handleTestInference = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const res = await apiFetch("/api/v1/models/test-inference", {
+      method: "POST",
+      body: JSON.stringify({
+        model_identifier: testModel,
+        prompt: testPrompt,
+      }),
+    });
+    setTestResult(res);
+  };
+
   return (
     <div className="space-y-6">
       <PageHeader
         title={t.nav.models}
-        subtitle="Dynamiczny, niezależny od dostawcy rejestr modeli chmurowych, lokalnych (Ollama) i HTTP z łańcuchami fallback i limitami budżetowymi."
+        subtitle="Dynamiczny rejestr modeli chmurowych (OpenAI, Anthropic, OpenRouter), lokalnych (Ollama) i HTTP z łańcuchami fallback i żywą diagnostyką wnioskowania."
       />
+
+      {statusMsg && (
+        <div className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 p-3 text-xs text-emerald-200">
+          {statusMsg}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
         {providers.map((p) => (
@@ -232,6 +276,97 @@ export function ModelsProvidersPage() {
             </div>
           </Card>
         ))}
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <Card>
+          <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold text-zinc-100">
+            <KeyRound className="h-4 w-4 text-indigo-400" />
+            Powiąż Klucz API Dostawcy lub Endpoint Ollama (Sesja Runtime)
+          </h3>
+          <form onSubmit={handleSaveSecret} className="space-y-3 text-xs">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <select
+                value={secretSlug}
+                onChange={(e) => setSecretSlug(e.target.value)}
+                className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-zinc-100"
+              >
+                {providers
+                  .filter((p) => p.slug !== "apex-analytical")
+                  .map((p) => (
+                    <option key={p.slug} value={p.slug}>
+                      {p.name} ({p.slug})
+                    </option>
+                  ))}
+              </select>
+              <input
+                type="password"
+                value={apiKeyInput}
+                onChange={(e) => setApiKeyInput(e.target.value)}
+                placeholder="Klucz API (np. sk-... lub sk-ant-...)"
+                className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-zinc-100"
+              />
+            </div>
+            <div className="flex gap-2">
+              <input
+                value={overrideBaseUrl}
+                onChange={(e) => setOverrideBaseUrl(e.target.value)}
+                placeholder="Opcjonalnie nadpisz URL (np. http://192.168.1.10:11434)"
+                className="flex-1 rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-zinc-100"
+              />
+              <button
+                type="submit"
+                className="rounded-lg bg-indigo-600 px-4 py-2 font-semibold text-white hover:bg-indigo-500"
+              >
+                Zapisz Klucz
+              </button>
+            </div>
+          </form>
+        </Card>
+
+        <Card>
+          <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold text-zinc-100">
+            <CheckCircle2 className="h-4 w-4 text-emerald-400" />
+            Test Wnioskowania Live LLM i Łańcucha Fallback
+          </h3>
+          <form onSubmit={handleTestInference} className="space-y-3 text-xs">
+            <div className="flex gap-2">
+              <input
+                value={testModel}
+                onChange={(e) => setTestModel(e.target.value)}
+                placeholder="Model (np. gpt-4.1-mini, claude-sonnet-4-0, llama3.2)"
+                className="flex-1 rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-zinc-100"
+              />
+              <button
+                type="submit"
+                className="rounded-lg bg-emerald-600 px-4 py-2 font-semibold text-white hover:bg-emerald-500"
+              >
+                Testuj Model
+              </button>
+            </div>
+            <input
+              value={testPrompt}
+              onChange={(e) => setTestPrompt(e.target.value)}
+              className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-zinc-100"
+            />
+          </form>
+          {testResult && (
+            <div className="mt-3 rounded-lg border border-zinc-800 bg-zinc-950/80 p-3 text-xs text-zinc-300">
+              <div className="mb-1 flex flex-wrap items-center gap-2 text-[11px] text-zinc-400">
+                <Badge tone={testResult.live_llm_invoked ? "emerald" : "amber"}>
+                  {testResult.live_llm_invoked ? "LIVE LLM" : "LOCAL FALLBACK"}
+                </Badge>
+                <span>
+                  {testResult.provider_slug} / {testResult.model_identifier}
+                </span>
+                <span>· {testResult.latency_ms} ms</span>
+                <span>· {testResult.total_tokens} tok</span>
+                <span>· ${testResult.cost_usd}</span>
+              </div>
+              <p className="text-zinc-200">{testResult.content}</p>
+            </div>
+          )}
+        </Card>
       </div>
 
       <Card>
