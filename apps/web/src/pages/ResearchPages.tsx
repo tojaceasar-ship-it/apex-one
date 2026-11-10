@@ -1,10 +1,12 @@
 import React, { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
+  Activity,
   AlertTriangle,
   ArrowRight,
   BookOpen,
   CheckCircle2,
+  Cpu,
   Download,
   FileText,
   FolderPlus,
@@ -13,11 +15,12 @@ import {
   RefreshCw,
   Search,
   ShieldAlert,
+  Sparkles,
   Trash2,
   Upload,
 } from "lucide-react";
 import { apiFetch } from "../api";
-import { Badge, Card, PageHeader } from "../components/Layout";
+import { Badge, Card, PageHeader, StatCard } from "../components/Layout";
 import { useAuth } from "../context/AuthContext";
 
 const RESEARCH_STATES = [
@@ -88,6 +91,13 @@ export function CommandCenterPage() {
     }
   };
 
+  const stageProgressPct = (stateName: string) => {
+    const idx = RESEARCH_STATES.indexOf(stateName);
+    if (stateName === "COMPLETED") return 100;
+    if (idx < 0) return 15;
+    return Math.min(100, Math.max(12, Math.round(((idx + 1) / 11) * 100)));
+  };
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -96,37 +106,43 @@ export function CommandCenterPage() {
         actions={
           <button
             onClick={() => void load()}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-200 hover:border-indigo-500"
+            className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2 text-xs font-medium text-zinc-200 transition hover:border-indigo-400/50 hover:bg-white/[0.08]"
           >
-            <RefreshCw className="h-3.5 w-3.5" />
+            <RefreshCw className="h-3.5 w-3.5 text-indigo-400" />
             {t.common.refresh}
           </button>
         }
       />
 
       {err && (
-        <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-3 text-xs text-rose-300">
+        <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 p-3 text-xs text-rose-200">
           {err}
         </div>
       )}
 
+      {/* Telemetry Banner */}
       {envStatus && (
-        <Card className="border-indigo-500/25 bg-gradient-to-r from-[#121620] to-[#151a29]">
+        <div className="relative overflow-hidden rounded-2xl border border-indigo-400/25 bg-gradient-to-r from-indigo-950/40 via-[#111626]/95 to-violet-950/30 px-5 py-4 shadow-lg">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-indigo-400">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-widest text-indigo-300">
+                <Sparkles className="h-3.5 w-3.5 text-indigo-400" />
                 Status Środowiska Wykonawczego: {envStatus.verdict}
               </div>
-              <p className="mt-1 text-xs text-zinc-400">
-                Docelowa baza produkcyjna: PostgreSQL 16 + pgvector + RLS ·
+              <p className="text-xs text-zinc-300/90">
+                Docelowa baza produkcyjna: <b className="text-white">PostgreSQL 16 + pgvector + RLS</b> ·
                 Sandbox nietestowanego kodu:{" "}
-                {envStatus.experiment_sandbox?.isolation_verified
-                  ? "ZWERYFIKOWANY"
-                  : "ZABLOKOWANY (Polityka Bezpieczeństwa)"}{" "}
-                · Węzeł Lokalny Fizyczny:{" "}
-                {envStatus.hybrid_local_node?.user_machine_connected
-                  ? "POŁĄCZONY"
-                  : "NIEPOŁĄCZONY (Izolacja Chmurowa Arena)"}
+                <span className="text-amber-300">
+                  {envStatus.experiment_sandbox?.isolation_verified
+                    ? "ZWERYFIKOWANY"
+                    : "ZABLOKOWANY (Polityka Bezpieczeństwa)"}
+                </span>{" "}
+                · Węzeł Lokalny:{" "}
+                <span className="text-zinc-300">
+                  {envStatus.hybrid_local_node?.user_machine_connected
+                    ? "POŁĄCZONY"
+                    : "TRYB CHMUROWY ARENA"}
+                </span>
               </p>
             </div>
             <div className="flex flex-wrap gap-2">
@@ -136,138 +152,256 @@ export function CommandCenterPage() {
               <Badge tone="indigo">Outbox + Checkpointy: AKTYWNE</Badge>
             </div>
           </div>
-        </Card>
+        </div>
       )}
 
+      {/* Executive KPI Cards */}
       {summary && (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <Card>
-            <div className="text-xs text-zinc-400">Wykonania Agentów (DAG)</div>
-            <div className="mt-2 text-2xl font-bold text-zinc-100">
-              {summary.agent_execution_count}
-            </div>
-            <div className="mt-1 text-xs text-emerald-400">
-              Sukces: {summary.successful_executions} · Śr. {summary.avg_execution_time_ms} ms
-            </div>
-          </Card>
-          <Card>
-            <div className="text-xs text-zinc-400">Zużyte Tokeny i Koszt Modeli</div>
-            <div className="mt-2 text-2xl font-bold text-zinc-100">
-              {summary.total_tokens_consumed.toLocaleString()} tok
-            </div>
-            <div className="mt-1 text-xs text-indigo-400">
-              Koszt: ${summary.total_model_cost_usd.toFixed(4)} ({summary.budget_utilization_pct}% budżetu)
-            </div>
-          </Card>
-          <Card>
-            <div className="text-xs text-zinc-400">Wywołania Narzędzi (Idempotentne)</div>
-            <div className="mt-2 text-2xl font-bold text-zinc-100">
-              {summary.tool_invocation_count}
-            </div>
-            <div className="mt-1 text-xs text-zinc-400">
-              Przepływy: {summary.workflow_succeeded}/{summary.workflow_total} ukończone
-            </div>
-          </Card>
-          <Card>
-            <div className="text-xs text-zinc-400">Oczekujące Zatwierdzenia (R2/R3)</div>
-            <div className="mt-2 text-2xl font-bold text-amber-300">
-              {summary.pending_approvals_count}
-            </div>
-            <Link
-              to="/approvals"
-              className="mt-1 inline-flex items-center gap-1 text-xs text-indigo-400 hover:underline"
-            >
-              Otwórz Centrum Zatwierdzeń <ArrowRight className="h-3 w-3" />
-            </Link>
-          </Card>
+          <StatCard
+            label="Wykonania Agentów (DAG)"
+            value={summary.agent_execution_count}
+            icon={Activity}
+            tone="emerald"
+            detail={
+              <span className="text-emerald-300">
+                Sukces: {summary.successful_executions} · Śr. {summary.avg_execution_time_ms} ms
+              </span>
+            }
+          />
+          <StatCard
+            label="Zużyte Tokeny i Koszt Modeli"
+            value={`${summary.total_tokens_consumed.toLocaleString()} tok`}
+            icon={Cpu}
+            tone="indigo"
+            detail={
+              <span>
+                Koszt: <b className="text-indigo-300">${summary.total_model_cost_usd.toFixed(4)}</b> ({summary.budget_utilization_pct}% budżetu)
+              </span>
+            }
+          />
+          <StatCard
+            label="Wywołania Narzędzi (Idempotentne)"
+            value={summary.tool_invocation_count}
+            icon={Sparkles}
+            tone="violet"
+            detail={
+              <span>
+                Przepływy: {summary.workflow_succeeded}/{summary.workflow_total} ukończone
+              </span>
+            }
+          />
+          <StatCard
+            label="Oczekujące Zatwierdzenia (R2/R3)"
+            value={summary.pending_approvals_count}
+            icon={ShieldAlert}
+            tone="amber"
+            footer={
+              <Link
+                to="/approvals"
+                className="inline-flex items-center gap-1 text-xs font-medium text-indigo-300 transition hover:text-indigo-200 hover:underline"
+              >
+                Otwórz Centrum Zatwierdzeń <ArrowRight className="h-3 w-3" />
+              </Link>
+            }
+          />
         </div>
       )}
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         <Card className="lg:col-span-2">
-          <h2 className="text-sm font-semibold text-zinc-100">
-            Szybkie Uruchomienie Zespołu Badawczego (8 Wyspecjalizowanych Agentów)
-          </h2>
-          <p className="mt-1 text-xs text-zinc-400">
-            Uruchamia pełny potok: Supervisor → Planner → Source Scout → Evidence Analyst → Data Analyst → Experiment Engineer → Critic/Replicator → Research Writer.
-          </p>
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <h2 className="text-base font-semibold text-white">
+                Szybkie Uruchomienie Zespołu Badawczego (8 Wyspecjalizowanych Agentów)
+              </h2>
+              <p className="mt-1 text-xs text-zinc-400">
+                Orkiestracja DAG z trwałymi punktami kontrolnymi oraz idempotentnym rejestrem narzędzi.
+              </p>
+            </div>
+            <Badge tone="violet">8 Ról AgentDNA</Badge>
+          </div>
+
+          {/* Interactive 8-Agent Pipeline Ribbon */}
+          <div className="mt-4 flex flex-wrap items-center gap-1.5 rounded-xl border border-white/[0.06] bg-black/30 px-3 py-2.5 text-[11px]">
+            {[
+              "1. Supervisor",
+              "2. Planner",
+              "3. Source Scout",
+              "4. Evidence",
+              "5. Data",
+              "6. Experiment",
+              "7. Critic",
+              "8. Writer",
+            ].map((roleName, idx, arr) => (
+              <React.Fragment key={roleName}>
+                <span className="rounded-lg border border-indigo-400/20 bg-indigo-500/10 px-2 py-0.5 font-medium text-indigo-200">
+                  {roleName}
+                </span>
+                {idx < arr.length - 1 && (
+                  <span className="text-zinc-600">→</span>
+                )}
+              </React.Fragment>
+            ))}
+          </div>
+
           <form onSubmit={handleQuickRun} className="mt-4 flex flex-col gap-3 sm:flex-row">
             <input
               required
               value={quickObjective}
               onChange={(e) => setQuickObjective(e.target.value)}
               placeholder="Wprowadź cel badawczy lub hipotezę do weryfikacji..."
-              className="flex-1 rounded-lg border border-zinc-800 bg-zinc-950 px-3.5 py-2 text-sm text-zinc-100 focus:border-indigo-500 focus:outline-none"
+              className="flex-1 rounded-xl border px-3.5 py-2.5 text-sm text-white"
             />
             <button
               type="submit"
               disabled={launching}
-              className="inline-flex items-center justify-center gap-2 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-semibold text-white hover:bg-indigo-500 disabled:opacity-50"
+              className="inline-flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-indigo-600 to-violet-600 px-5 py-2.5 text-xs font-semibold text-white shadow-lg shadow-indigo-600/25 transition hover:brightness-110 disabled:opacity-50"
             >
               <Play className="h-3.5 w-3.5" />
               {launching ? "Wykonywanie..." : "Uruchom Zespół 8 Agentów"}
             </button>
           </form>
 
-          <div className="mt-6">
-            <div className="mb-2 flex items-center justify-between">
+          {/* Quick Prompt Suggestions */}
+          <div className="mt-2.5 flex flex-wrap items-center gap-1.5 text-[11px]">
+            <span className="text-zinc-500">Przykłady:</span>
+            {[
+              "Weryfikacja sprzeczności w korpusie dowodowym RAG",
+              "Analiza kompromisu koszt-trafność zespołów wieloagentowych",
+            ].map((sample) => (
+              <button
+                key={sample}
+                type="button"
+                onClick={() => setQuickObjective(sample)}
+                className="rounded-full border border-white/[0.07] bg-white/[0.03] px-2.5 py-0.5 text-zinc-400 transition hover:border-indigo-400/35 hover:text-zinc-200"
+              >
+                {sample}
+              </button>
+            ))}
+          </div>
+
+          <div className="mt-6 border-t border-white/[0.06] pt-5">
+            <div className="mb-3 flex items-center justify-between">
               <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
                 Aktywne Projekty Badawcze
               </h3>
-              <Link to="/projects" className="text-xs text-indigo-400 hover:underline">
+              <Link to="/projects" className="text-xs font-medium text-indigo-300 hover:underline">
                 Wszystkie ({projects.length}) →
               </Link>
             </div>
-            <div className="space-y-2">
-              {projects.slice(0, 4).map((p) => (
-                <Link
-                  key={p.id}
-                  to={`/projects/${p.id}`}
-                  className="flex items-center justify-between rounded-lg border border-zinc-800/80 bg-zinc-900/60 px-3.5 py-2.5 hover:border-indigo-500/40"
-                >
-                  <div className="min-w-0 pr-3">
-                    <div className="truncate text-sm font-medium text-zinc-100">
-                      {p.title}
+            <div className="space-y-2.5">
+              {projects.slice(0, 4).map((p) => {
+                const pct = stageProgressPct(p.state);
+                return (
+                  <Link
+                    key={p.id}
+                    to={`/projects/${p.id}`}
+                    className="group block rounded-xl border border-white/[0.07] bg-white/[0.025] px-4 py-3 transition-all hover:border-indigo-400/40 hover:bg-white/[0.045]"
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-semibold text-zinc-100 group-hover:text-white">
+                          {p.title}
+                        </div>
+                        <div className="mt-0.5 truncate text-xs text-zinc-400">
+                          Przestrzeń: <span className="text-zinc-300">{p.workspace_scope.toUpperCase()}</span> · Wersja v{p.version}
+                        </div>
+                      </div>
+                      <Badge tone={p.state === "COMPLETED" ? "emerald" : "indigo"}>
+                        {p.state}
+                      </Badge>
                     </div>
-                    <div className="truncate text-xs text-zinc-400">
-                      Przestrzeń: {p.workspace_scope.toUpperCase()} · Wersja v{p.version}
+                    <div className="mt-2.5 h-1.5 w-full overflow-hidden rounded-full bg-white/[0.06]">
+                      <div
+                        className={`h-full rounded-full transition-all ${
+                          p.state === "COMPLETED"
+                            ? "bg-gradient-to-r from-emerald-500 to-teal-400"
+                            : "bg-gradient-to-r from-indigo-500 to-violet-500"
+                        }`}
+                        style={{ width: `${pct}%` }}
+                      />
                     </div>
-                  </div>
-                  <Badge tone={p.state === "COMPLETED" ? "emerald" : "indigo"}>
-                    {p.state}
-                  </Badge>
-                </Link>
-              ))}
+                  </Link>
+                );
+              })}
             </div>
           </div>
         </Card>
 
-        <Card>
-          <h2 className="text-sm font-semibold text-zinc-100">
-            Benchmark Porównawczy (Single vs Multi-Agent)
-          </h2>
-          <p className="mt-1 text-xs text-zinc-400">
-            Rzeczywiste wyniki na oznakowanym korpusie syntetycznym SRC-SYN-01..04 (bez predefiniowanego zwycięzcy):
-          </p>
-          <div className="mt-4 space-y-3">
-            {(summary?.benchmark_comparisons || []).slice(0, 2).map((b: any) => (
-              <div
-                key={b.id}
-                className="rounded-lg border border-zinc-800 bg-zinc-900/70 p-3 text-xs"
-              >
-                <div className="font-semibold text-zinc-200">{b.label}</div>
-                <div className="mt-2 grid grid-cols-2 gap-1.5 text-zinc-400">
-                  <span>Trafność badawcza: <b className="text-zinc-100">{(b.scores?.research_accuracy * 100).toFixed(0)}%</b></span>
-                  <span>Jakość dowodów: <b className="text-zinc-100">{(b.scores?.evidence_quality * 100).toFixed(0)}%</b></span>
-                  <span>Efekt. kosztowa: <b className="text-zinc-100">{(b.scores?.cost_efficiency * 100).toFixed(0)}%</b></span>
-                  <span>Tokeny: <b className="text-indigo-300">{b.tokens_used}</b></span>
-                </div>
-              </div>
-            ))}
+        <Card className="flex flex-col justify-between">
+          <div>
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-base font-semibold text-white">
+                Benchmark Porównawczy
+              </h2>
+              <Badge tone="indigo">Part IX</Badge>
+            </div>
+            <p className="mt-1 text-xs text-zinc-400">
+              Rzeczywiste wyniki Single-Agent vs Multi-Agent na korpusie syntetycznym SRC-SYN-01..04:
+            </p>
+            <div className="mt-4 space-y-3.5">
+              {(summary?.benchmark_comparisons || []).slice(0, 2).map((b: any) => {
+                const acc = Math.round((b.scores?.research_accuracy || 0) * 100);
+                const ev = Math.round((b.scores?.evidence_quality || 0) * 100);
+                const cost = Math.round((b.scores?.cost_efficiency || 0) * 100);
+                return (
+                  <div
+                    key={b.id}
+                    className="rounded-xl border border-white/[0.07] bg-white/[0.025] p-3.5 text-xs"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-semibold text-white">{b.label}</span>
+                      <span className="rounded-md bg-indigo-500/15 px-2 py-0.5 font-mono text-[11px] text-indigo-300 tabular-nums">
+                        {b.tokens_used} tok
+                      </span>
+                    </div>
+                    <div className="mt-3 space-y-2">
+                      <div>
+                        <div className="mb-1 flex justify-between text-[11px] text-zinc-400">
+                          <span>Trafność badawcza</span>
+                          <b className="text-zinc-100 tabular-nums">{acc}%</b>
+                        </div>
+                        <div className="h-1.5 rounded-full bg-white/[0.06]">
+                          <div
+                            className="h-full rounded-full bg-indigo-400"
+                            style={{ width: `${acc}%` }}
+                          />
+                        </div>
+                      </div>
+                      <div>
+                        <div className="mb-1 flex justify-between text-[11px] text-zinc-400">
+                          <span>Jakość dowodów</span>
+                          <b className="text-zinc-100 tabular-nums">{ev}%</b>
+                        </div>
+                        <div className="h-1.5 rounded-full bg-white/[0.06]">
+                          <div
+                            className="h-full rounded-full bg-emerald-400"
+                            style={{ width: `${ev}%` }}
+                          />
+                        </div>
+                      </div>
+                      <div>
+                        <div className="mb-1 flex justify-between text-[11px] text-zinc-400">
+                          <span>Efektywność kosztowa</span>
+                          <b className="text-zinc-100 tabular-nums">{cost}%</b>
+                        </div>
+                        <div className="h-1.5 rounded-full bg-white/[0.06]">
+                          <div
+                            className="h-full rounded-full bg-amber-400"
+                            style={{ width: `${cost}%` }}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
           <Link
             to="/evaluations"
-            className="mt-4 inline-flex items-center gap-1 text-xs font-medium text-indigo-400 hover:underline"
+            className="mt-5 inline-flex items-center justify-center gap-1.5 rounded-xl border border-indigo-400/30 bg-indigo-500/10 px-3.5 py-2 text-xs font-medium text-indigo-200 transition hover:bg-indigo-500/20"
           >
             Pełna macierz 9 kategorii ewaluacji <ArrowRight className="h-3.5 w-3.5" />
           </Link>
@@ -931,100 +1065,134 @@ export function EvidenceGraphPage() {
       />
 
       {graph?.summary && (
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-          <Card>
-            <div className="text-xs text-zinc-400">Twierdzenia ogółem</div>
-            <div className="mt-1 text-2xl font-bold">{graph.summary.total_claims}</div>
-          </Card>
-          <Card>
-            <div className="text-xs text-zinc-400">Wspierane dowodowo</div>
-            <div className="mt-1 text-2xl font-bold text-emerald-400">
-              {graph.summary.supported_claims}
-            </div>
-          </Card>
-          <Card>
-            <div className="text-xs text-zinc-400">Wykryte sprzeczności</div>
-            <div className="mt-1 text-2xl font-bold text-rose-400">
-              {graph.summary.contradicted_claims}
-            </div>
-          </Card>
-          <Card>
-            <div className="text-xs text-zinc-400">Pokrycie źródłowe</div>
-            <div className="mt-1 text-2xl font-bold text-indigo-400">
-              {graph.summary.evidence_coverage_pct}%
-            </div>
-          </Card>
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <StatCard
+            label="Twierdzenia ogółem"
+            value={graph.summary.total_claims}
+            icon={FileText}
+            tone="indigo"
+          />
+          <StatCard
+            label="Wspierane dowodowo"
+            value={graph.summary.supported_claims}
+            icon={CheckCircle2}
+            tone="emerald"
+          />
+          <StatCard
+            label="Wykryte sprzeczności"
+            value={graph.summary.contradicted_claims}
+            icon={AlertTriangle}
+            tone="rose"
+          />
+          <StatCard
+            label="Pokrycie źródłowe"
+            value={`${graph.summary.evidence_coverage_pct}%`}
+            icon={Network}
+            tone="violet"
+          />
         </div>
       )}
 
       {/* Interactive SVG Topology */}
       <Card>
-        <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-zinc-100">
-          <Network className="h-4 w-4 text-indigo-400" />
-          Wizualizacja Topologii Grafu Dowodowego (Źródła Pierwotne → Twierdzenia)
-        </h2>
-        <div className="overflow-x-auto rounded-lg border border-zinc-800 bg-[#0b0d13] p-3">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+          <h2 className="flex items-center gap-2 text-sm font-semibold text-white">
+            <Network className="h-4 w-4 text-indigo-400" />
+            Wizualizacja Topologii Grafu Dowodowego (Źródła Pierwotne → Twierdzenia)
+          </h2>
+          <div className="flex flex-wrap items-center gap-3 text-[11px] text-zinc-400">
+            <span className="flex items-center gap-1.5">
+              <span className="h-2 w-4 rounded-full bg-indigo-400" />
+              Dowód wspierający
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="h-0.5 w-4 border-t-2 border-dashed border-rose-400" />
+              Sprzeczność międzyźródłowa
+            </span>
+          </div>
+        </div>
+
+        <div className="apex-blueprint-grid overflow-x-auto rounded-2xl border border-white/[0.08] p-4 shadow-inner">
           <svg
-            width="860"
-            height={Math.max(240, Math.max(sourceNodes.length, claimNodes.length) * 62 + 40)}
+            width="880"
+            height={Math.max(250, Math.max(sourceNodes.length, claimNodes.length) * 62 + 44)}
             className="mx-auto block"
           >
+            <defs>
+              <linearGradient id="edgeSupport" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" stopColor="#60A5FA" />
+                <stop offset="100%" stopColor="#34D399" />
+              </linearGradient>
+              <linearGradient id="edgeContra" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" stopColor="#FB7185" />
+                <stop offset="100%" stopColor="#F43F5E" />
+              </linearGradient>
+            </defs>
+
             {(graph?.edges || []).map((ed: any) => {
               const sIdx = sourceNodes.findIndex((n: any) => n.id === ed.from);
               const cIdx = claimNodes.findIndex((n: any) => n.id === ed.to);
               if (sIdx < 0 || cIdx < 0) return null;
-              const y1 = 45 + sIdx * 58;
-              const y2 = 45 + cIdx * 58;
+              const y1 = 46 + sIdx * 60;
+              const y2 = 46 + cIdx * 60;
               const isContra = ed.evidence_type === "contradicting";
               return (
                 <g key={ed.id}>
                   <path
-                    d={`M 290 ${y1} C 430 ${y1}, 430 ${y2}, 560 ${y2}`}
+                    d={`M 294 ${y1} C 435 ${y1}, 435 ${y2}, 570 ${y2}`}
                     fill="none"
-                    stroke={isContra ? "#f43f5e" : "#6366f1"}
-                    strokeWidth={2}
-                    strokeDasharray={isContra ? "5,4" : undefined}
+                    stroke={isContra ? "url(#edgeContra)" : "url(#edgeSupport)"}
+                    strokeWidth={2.2}
+                    strokeOpacity={0.9}
+                    strokeDasharray={isContra ? "6,4" : undefined}
                   />
                 </g>
               );
             })}
             {sourceNodes.map((sn: any, idx: number) => (
-              <g key={sn.id} transform={`translate(20, ${22 + idx * 58})`}>
+              <g key={sn.id} transform={`translate(20, ${22 + idx * 60})`}>
                 <rect
-                  width="270"
-                  height="42"
-                  rx="8"
-                  fill="#151b2b"
-                  stroke="#3b82f6"
+                  width="274"
+                  height="46"
+                  rx="11"
+                  fill="#101729"
+                  stroke="#60A5FA"
+                  strokeOpacity="0.55"
                   strokeWidth="1.2"
                 />
-                <text x="12" y="25" fill="#e4e4e7" fontSize="11">
-                  [{sn.source_type}] {sn.label.slice(0, 34)}
+                <text x="14" y="19" fill="#93C5FD" fontSize="9.5" fontWeight="600">
+                  ŹRÓDŁO · {String(sn.source_type || "DOC").toUpperCase()}
                 </text>
+                <text x="14" y="34" fill="#F4F4F5" fontSize="11">
+                  {sn.label.slice(0, 35)}
+                </text>
+                <circle cx="274" cy="23" r="4" fill="#60A5FA" />
               </g>
             ))}
             {claimNodes.map((cn: any, idx: number) => {
               const stroke =
                 cn.status === "supported"
-                  ? "#10b981"
+                  ? "#34D399"
                   : cn.status === "contradicted"
-                  ? "#f43f5e"
-                  : "#f59e0b";
+                  ? "#FB7185"
+                  : "#FBBF24";
               return (
-                <g key={cn.id} transform={`translate(560, ${22 + idx * 58})`}>
+                <g key={cn.id} transform={`translate(570, ${22 + idx * 60})`}>
                   <rect
-                    width="280"
-                    height="42"
-                    rx="8"
-                    fill="#161822"
+                    width="290"
+                    height="46"
+                    rx="11"
+                    fill="#131726"
                     stroke={stroke}
+                    strokeOpacity="0.7"
                     strokeWidth="1.4"
                   />
-                  <text x="12" y="19" fill={stroke} fontSize="10" fontWeight="bold">
-                    {cn.status.toUpperCase()}
+                  <circle cx="0" cy="23" r="4" fill={stroke} />
+                  <text x="14" y="19" fill={stroke} fontSize="9.5" fontWeight="700">
+                    TWIERDZENIE · {cn.status.toUpperCase()}
                   </text>
-                  <text x="12" y="34" fill="#e4e4e7" fontSize="10.5">
-                    {cn.label.slice(0, 38)}...
+                  <text x="14" y="34" fill="#F4F4F5" fontSize="10.5">
+                    {cn.label.slice(0, 40)}...
                   </text>
                 </g>
               );

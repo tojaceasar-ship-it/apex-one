@@ -220,20 +220,40 @@ export function ExperimentLabPage() {
               </div>
 
               {latestRun && (
-                <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-6">
-                  {(latestRun.metrics || []).map((m: any) => (
-                    <div
-                      key={m.metric_name}
-                      className="rounded-lg border border-zinc-800 bg-zinc-900/70 p-2 text-xs"
-                    >
-                      <div className="truncate text-[10px] text-zinc-400">
-                        {m.metric_name}
+                <div className="mt-4 grid grid-cols-2 gap-2.5 sm:grid-cols-3 lg:grid-cols-6">
+                  {(latestRun.metrics || []).map((m: any) => {
+                    const isRatio =
+                      typeof m.metric_value === "number" &&
+                      m.metric_value >= 0 &&
+                      m.metric_value <= 1 &&
+                      (!m.unit || m.unit === "ratio");
+                    return (
+                      <div
+                        key={m.metric_name}
+                        className="rounded-xl border border-white/[0.07] bg-white/[0.03] px-3 py-2.5 text-xs"
+                      >
+                        <div className="truncate text-[10px] font-medium uppercase tracking-wider text-zinc-400">
+                          {String(m.metric_name).replace(/_/g, " ")}
+                        </div>
+                        <div className="mt-1 font-semibold text-white tabular-nums">
+                          {isRatio
+                            ? `${(m.metric_value * 100).toFixed(1)}%`
+                            : m.metric_value}{" "}
+                          {!isRatio && m.unit && (
+                            <span className="text-[10px] text-zinc-500">{m.unit}</span>
+                          )}
+                        </div>
+                        {isRatio && (
+                          <div className="mt-1.5 h-1 rounded-full bg-white/[0.07]">
+                            <div
+                              className="h-full rounded-full bg-gradient-to-r from-indigo-500 to-violet-400"
+                              style={{ width: `${Math.round(m.metric_value * 100)}%` }}
+                            />
+                          </div>
+                        )}
                       </div>
-                      <div className="mt-0.5 font-semibold text-zinc-100">
-                        {m.metric_value} <span className="text-[10px] text-zinc-500">{m.unit}</span>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </Card>
