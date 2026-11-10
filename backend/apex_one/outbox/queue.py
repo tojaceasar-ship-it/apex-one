@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
-from sqlalchemy import select, text, update
+from sqlalchemy import DateTime, Integer, String, bindparam, select, text, update
 
 from apex_one.db.adapter import PostgresConnectionAdapter
 from apex_one.db.base import utcnow
@@ -98,18 +98,18 @@ CLAIM_BATCH_SQL = text(
         SELECT id
         FROM outbox_events
         WHERE (
-            (status = 'PENDING' AND available_at <= :now AND cancel_requested = false)
+            (status = 'PENDING' AND available_at <= CAST(:now AS timestamptz) AND cancel_requested = false)
             OR (status = 'PENDING' AND cancel_requested = true)
         )
         ORDER BY available_at ASC, created_at ASC
-        LIMIT :batch_size
+        LIMIT CAST(:batch_size AS integer)
         FOR UPDATE SKIP LOCKED
     )
     UPDATE outbox_events AS o
     SET status = CASE WHEN o.cancel_requested THEN 'CANCELLED' ELSE 'PROCESSING' END,
-        locked_by = CASE WHEN o.cancel_requested THEN NULL ELSE :worker_id END,
-        lease_expires_at = CASE WHEN o.cancel_requested THEN NULL ELSE :lease_expires_at END,
-        processed_at = CASE WHEN o.cancel_requested THEN :now ELSE o.processed_at END,
+        locked_by = CASE WHEN o.cancel_requested THEN CAST(NULL AS varchar) ELSE CAST(:worker_id AS varchar) END,
+        lease_expires_at = CASE WHEN o.cancel_requested THEN CAST(NULL AS timestamptz) ELSE CAST(:lease_expires_at AS timestamptz) END,
+        processed_at = CASE WHEN o.cancel_requested THEN CAST(:now AS timestamptz) ELSE o.processed_at END,
         attempts = CASE WHEN o.cancel_requested THEN o.attempts ELSE o.attempts + 1 END
     FROM candidate
     WHERE o.id = candidate.id
@@ -129,6 +129,11 @@ CLAIM_BATCH_SQL = text(
         o.recovery_count,
         o.cancel_requested
     """
+).bindparams(
+    bindparam("now", type_=DateTime(timezone=True)),
+    bindparam("batch_size", type_=Integer()),
+    bindparam("worker_id", type_=String()),
+    bindparam("lease_expires_at", type_=DateTime(timezone=True)),
 )
 
 
