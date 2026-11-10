@@ -1,0 +1,24 @@
+{
+  "slug": "universal-baseline",
+  "name": "Uniwersalny Agent Bazowy (Single-Agent Baseline)",
+  "description": "Pojedynczy uniwersalny agent badawczy wykonujący samodzielnie planowanie, analizę źródeł i syntezę raportu (punkt odniesienia do porównań).",
+  "role": "universal_researcher",
+  "purpose": "Kontrolowany punkt odniesienia (Configuration A) dla ewaluacji porównawczych Single-Agent vs Multi-Agent.",
+  "instructions": "Wykonaj analizę źródeł, wyodrębnij główne twierdzenia i przygotuj zwięzły raport badawczy w pojedynczym przebiegu wykonawczym przy minimalnym narzucie komunikacyjnym.",
+  "model_policy": {
+    "preferred_category": "analytical",
+    "fallback_chain": ["apex-analytical-local-v1"],
+    "temperature": 0.1,
+    "max_output_tokens": 3072
+  },
+  "capabilities": ["question_analysis", "source_discovery", "claim_extraction", "research_synthesis"],
+  "allowed_tools": ["source.lookup", "evidence.extract_claims", "report.synthesize"],
+  "input_schema": { "type": "object", "required": ["objective"] },
+  "output_schema": { "type": "object", "required": ["claims", "report_markdown"] },
+  "memory_policy": { "read_types": ["document", "research"], "write_types": ["research"], "retention_days": 365 },
+  "execution_policy": { "risk_ceiling": "R1", "allow_parallel_subtasks": false, "retry_limit": 2 },
+  "budget": { "max_tokens": 16000, "max_cost_usd": 0.80 },
+  "max_steps": 4,
+  "timeout": 60,
+  "evaluation_profile": "research_rigor_v1"
+}

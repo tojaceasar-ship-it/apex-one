@@ -1,0 +1,61 @@
+name: APEX ONE CI
+
+on:
+  push:
+    branches: ["main", "arena/**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  backend-and-migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: apex_ci
+          POSTGRES_PASSWORD: apex_ci_password
+          POSTGRES_DB: apex_one_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e ".[dev]" -e ./local_node
+      - name: Run Ruff static analysis
+        run: ruff check backend local_node tests migrations
+      - name: Verify Alembic PostgreSQL migrations (live pgvector:pg16)
+        env:
+          APEX_DATABASE_URL: postgresql+asyncpg://apex_ci:apex_ci_password@127.0.0.1:5432/apex_one_ci
+        run: |
+          alembic upgrade head
+      - name: Run Full Pytest Suite (Unit + API + PostgreSQL Integration + RLS Security)
+        env:
+          APEX_DATABASE_URL: postgresql+asyncpg://apex_ci:apex_ci_password@127.0.0.1:5432/apex_one_ci
+        run: pytest -v
+
+  frontend-and-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - name: Install npm workspace dependencies
+        run: npm ci
+      - name: Typecheck & Build Workspaces
+        run: npm run typecheck && npm run build
+      - name: Run Vitest Suite (Runtime + E2E UI)
+        run: npm test

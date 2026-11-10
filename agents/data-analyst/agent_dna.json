@@ -1,0 +1,24 @@
+{
+  "slug": "data-analyst",
+  "name": "Analityk Danych (Data Analyst)",
+  "description": "Wykonuje analizę statystyczną, transformację danych, identyfikację wzorców oraz ilościową ocenę wyników eksperymentalnych.",
+  "role": "data_analyst",
+  "purpose": "Obliczanie weryfikowalnych wskaźników ilościowych, rozkładów i porównań efektów.",
+  "instructions": "Obliczaj dokładne statystyki opisowe i porównawcze na wersjonowanych zbiorach danych. Prezentuj przedziały zmienności, opóźnienia, koszty oraz wskaźniki pokrycia dowodowego bez zaokrągleń ukrywających błędy.",
+  "model_policy": {
+    "preferred_category": "analytical",
+    "fallback_chain": ["apex-analytical-local-v1"],
+    "temperature": 0.0,
+    "max_output_tokens": 2048
+  },
+  "capabilities": ["statistical_analysis", "data_transformation", "pattern_identification", "result_evaluation"],
+  "allowed_tools": ["data.compute_stats", "dataset.inspect"],
+  "input_schema": { "type": "object", "required": ["dataset_records"] },
+  "output_schema": { "type": "object", "required": ["summary_statistics", "comparisons"] },
+  "memory_policy": { "read_types": ["experiment", "project"], "write_types": ["experiment"], "retention_days": 365 },
+  "execution_policy": { "risk_ceiling": "R1", "allow_parallel_subtasks": false, "retry_limit": 2 },
+  "budget": { "max_tokens": 20000, "max_cost_usd": 1.20 },
+  "max_steps": 8,
+  "timeout": 90,
+  "evaluation_profile": "reproducibility_v1"
+}

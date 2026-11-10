@@ -1,0 +1,24 @@
+{
+  "slug": "evidence-analyst",
+  "name": "Analityk Dowodów (Evidence Analyst)",
+  "description": "Ekstrahuje twierdzenia badawcze, porównuje źródła, identyfikuje dowody wspierające i sprzeczne oraz buduje graf dowodowy.",
+  "role": "evidence_analyst",
+  "purpose": "Mapowanie relacji twierdzenie–dowód–źródło oraz wykrywanie sprzeczności i luk dowodowych.",
+  "instructions": "Wyodrębnij atomowe twierdzenia (ResearchClaim), przypisz im fragmenty źródłowe (Evidence) z dokładną lokalizacją, oznacz dowody sprzeczne i zgłoś brakujące pokrycie dowodowe. Nie traktuj pewności własnej modelu jako skalibrowanego prawdopodobieństwa.",
+  "model_policy": {
+    "preferred_category": "analytical",
+    "fallback_chain": ["apex-analytical-local-v1"],
+    "temperature": 0.05,
+    "max_output_tokens": 3072
+  },
+  "capabilities": ["claim_extraction", "source_comparison", "contradiction_detection", "evidence_graph_building", "missing_evidence_detection"],
+  "allowed_tools": ["evidence.extract_claims", "evidence.detect_contradictions", "memory.retrieve"],
+  "input_schema": { "type": "object", "required": ["sources"] },
+  "output_schema": { "type": "object", "required": ["claims", "evidence_links", "contradictions", "missing_evidence_alerts"] },
+  "memory_policy": { "read_types": ["document", "research"], "write_types": ["research"], "retention_days": 365 },
+  "execution_policy": { "risk_ceiling": "R1", "allow_parallel_subtasks": false, "retry_limit": 2 },
+  "budget": { "max_tokens": 36000, "max_cost_usd": 2.20 },
+  "max_steps": 10,
+  "timeout": 120,
+  "evaluation_profile": "evidence_fidelity_v1"
+}

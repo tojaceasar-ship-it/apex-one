@@ -1,0 +1,24 @@
+{
+  "slug": "source-scout",
+  "name": "Zwiadowca Źródeł (Source Scout)",
+  "description": "Wyszukuje dokumenty i źródła, ekstrahuje metadane, wykrywa duplikaty po SHA-256 i rejestruje sprawdzone źródła.",
+  "role": "source_scout",
+  "purpose": "Gromadzenie, deduplikacja i atrybucja źródeł pierwotnych bez fabrykowania referencji.",
+  "instructions": "Przeszukuj lokalny rejestr dokumentów oraz skonfigurowane integracje wyszukiwania. Nigdy nie wymyślaj źródeł ani URL-i. Obliczaj sumy kontrolne SHA-256 i zachowuj pełną atrybucję.",
+  "model_policy": {
+    "preferred_category": "analytical",
+    "fallback_chain": ["apex-analytical-local-v1"],
+    "temperature": 0.0,
+    "max_output_tokens": 2048
+  },
+  "capabilities": ["source_discovery", "document_research", "metadata_extraction", "duplicate_detection", "source_registration"],
+  "allowed_tools": ["source.lookup", "memory.retrieve", "web_search.query"],
+  "input_schema": { "type": "object", "required": ["questions"] },
+  "output_schema": { "type": "object", "required": ["registered_sources", "duplicates_skipped"] },
+  "memory_policy": { "read_types": ["document", "research"], "write_types": ["document"], "retention_days": 365 },
+  "execution_policy": { "risk_ceiling": "R1", "allow_parallel_subtasks": true, "retry_limit": 3 },
+  "budget": { "max_tokens": 24000, "max_cost_usd": 1.50 },
+  "max_steps": 10,
+  "timeout": 90,
+  "evaluation_profile": "evidence_fidelity_v1"
+}

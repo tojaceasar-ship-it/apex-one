@@ -1,0 +1,24 @@
+{
+  "slug": "research-planner",
+  "name": "Planista Badawczy (Research Planner)",
+  "description": "Analizuje pytania badawcze, tworzy Research Brief, dobiera metodologię i definiuje mierzalne rezultaty oczekiwane.",
+  "role": "research_planner",
+  "purpose": "Strukturyzacja problemu badawczego w weryfikowalny plan i hipotezy.",
+  "instructions": "Przekształć cel projektu w ustrukturyzowany Research Brief, zestaw pytań badawczych, metodologię weryfikacji hipotez oraz kamienie milowe z kryteriami falsyfikowalności.",
+  "model_policy": {
+    "preferred_category": "analytical",
+    "fallback_chain": ["apex-analytical-local-v1"],
+    "temperature": 0.15,
+    "max_output_tokens": 2048
+  },
+  "capabilities": ["question_analysis", "brief_creation", "methodology_selection", "research_planning"],
+  "allowed_tools": ["memory.retrieve", "research.create_brief"],
+  "input_schema": { "type": "object", "required": ["objective"] },
+  "output_schema": { "type": "object", "required": ["brief", "questions", "methodology"] },
+  "memory_policy": { "read_types": ["research", "project"], "write_types": ["research"], "retention_days": 365 },
+  "execution_policy": { "risk_ceiling": "R1", "allow_parallel_subtasks": false, "retry_limit": 2 },
+  "budget": { "max_tokens": 24000, "max_cost_usd": 1.50 },
+  "max_steps": 8,
+  "timeout": 90,
+  "evaluation_profile": "research_rigor_v1"
+}

@@ -1,0 +1,70 @@
+# Optional Docker Compose stack for environments with Docker.
+# NOT required in Arena — see docs/LOCAL_DEVELOPMENT.md for Docker-free execution.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: apex_owner
+      POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD:-apex_owner_dev_pass}
+      POSTGRES_DB: apex_one
+    ports:
+      - "5432:5432"
+    volumes:
+      - apex_pgdata:/var/lib/postgresql/data
+      - ./infra/docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U apex_owner -d apex_one"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    profiles: ["with-redis"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.api
+    environment:
+      APEX_ENV: development
+      APEX_DATABASE_URL: postgresql+asyncpg://apex_app:${POSTGRES_APP_PASSWORD:-apex_app_dev_pass}@postgres:5432/apex_one
+      APEX_DB_POOL_MODE: pooled
+      APEX_ARENA_ISOLATED_MODE: "false"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.worker
+    environment:
+      APEX_ENV: development
+      APEX_DATABASE_URL: postgresql+asyncpg://apex_app:${POSTGRES_APP_PASSWORD:-apex_app_dev_pass}@postgres:5432/apex_one
+      APEX_DB_POOL_MODE: pooled
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.web
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api
+
+volumes:
+  apex_pgdata:

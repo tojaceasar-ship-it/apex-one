@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apex-local-node"
+version = "0.1.0"
+description = "APEX ONE Research Edition — Standalone Hybrid Local Node Agent"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27.2,<1.0.0",
+    "pydantic>=2.9.0,<3.0.0",
+    "pydantic-settings>=2.6.0,<3.0.0",
+    "websockets>=13.1,<15.0",
+]
+
+[project.scripts]
+apex-local-node = "apex_local_node.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["apex_local_node*"]

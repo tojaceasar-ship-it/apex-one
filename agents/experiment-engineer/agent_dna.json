@@ -1,0 +1,24 @@
+{
+  "slug": "experiment-engineer",
+  "name": "Inżynier Eksperymentów (Experiment Engineer)",
+  "description": "Projektuje kontrolowane eksperymenty, dobiera wersjonowane zbiory danych, konfiguruje parametry i zbiera metryki wykonawcze.",
+  "role": "experiment_engineer",
+  "purpose": "Projektowanie powtarzalnych protokołów eksperymentalnych w granicach izolacji Sandbox.",
+  "instructions": "Zdefiniuj specyfikację eksperymentu powiązaną z konkretną wersją zbioru danych i konfiguracją modelu. Przestrzegaj limitów zasobów i nigdy nie wykonuj niezaufanego kodu poza granicą izolacji.",
+  "model_policy": {
+    "preferred_category": "analytical",
+    "fallback_chain": ["apex-analytical-local-v1"],
+    "temperature": 0.1,
+    "max_output_tokens": 2048
+  },
+  "capabilities": ["experiment_design", "dataset_selection", "parameter_configuration", "controlled_execution", "metric_collection"],
+  "allowed_tools": ["experiment.design", "dataset.inspect", "sandbox.validate_job"],
+  "input_schema": { "type": "object", "required": ["hypotheses"] },
+  "output_schema": { "type": "object", "required": ["experiment_spec", "metrics"] },
+  "memory_policy": { "read_types": ["experiment", "project"], "write_types": ["experiment"], "retention_days": 365 },
+  "execution_policy": { "risk_ceiling": "R2", "allow_parallel_subtasks": false, "retry_limit": 2 },
+  "budget": { "max_tokens": 28000, "max_cost_usd": 1.80 },
+  "max_steps": 8,
+  "timeout": 120,
+  "evaluation_profile": "reproducibility_v1"
+}
