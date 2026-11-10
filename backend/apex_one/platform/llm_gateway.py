@@ -27,6 +27,7 @@ import httpx
 
 from apex_one.db.models import DEFAULT_EMBEDDING_DIM as EMBEDDING_DIM
 from apex_one.integrations_hub import SSRFBlockedError, assert_public_http_url
+from apex_one.platform.lan_llm_bridge import LanLLMBridgeBroker
 from apex_one.platform.memory_and_docs import embed_text_1536
 
 
@@ -123,8 +124,14 @@ def _normalize_to_1536(raw_vec: list[float]) -> list[float]:
 class LLMGateway:
     """Provider-neutral LLM & Embedding client with fallback and secret isolation."""
 
-    def __init__(self, *, http_timeout: float = 90.0) -> None:
+    def __init__(
+        self,
+        *,
+        http_timeout: float = 90.0,
+        lan_bridge: LanLLMBridgeBroker | None = None,
+    ) -> None:
         self._timeout = http_timeout
+        self.lan_bridge = lan_bridge or LanLLMBridgeBroker()
         # Keyed by (organization_id, provider_slug) -> secret string (never serialized)
         self._runtime_secrets: dict[tuple[str, str], str] = {}
         # Short-lived circuit breaker for unreachable private LAN hosts
@@ -250,8 +257,14 @@ class LLMGateway:
             if fb_slug and fb_slug in by_slug and fb_slug not in visited and fb_slug != "apex-analytical":
                 queue.append(by_slug[fb_slug])
 
+            bridge_ready = (
+                slug in {"lmstudio-lan-qwen", "ollama-local", "ollama"}
+                or prov.get("category") in {"compatible_http", "local_ollama"}
+            ) and self.lan_bridge.is_online(organization_id)
+
             if (
                 not bypass_circuit_breaker
+                and not bridge_ready
                 and self._unreachable_until.get(slug, 0.0) > time.monotonic()
             ):
                 last_err = f"{slug}: ConnectTimeout (cached unreachable LAN endpoint)"
@@ -323,6 +336,42 @@ class LLMGateway:
         )
 
         t0 = time.perf_counter()
+
+        # Reverse LAN Bridge relay for Cloud Preview -> Private LAN LLM (e.g. 192.168.18.184:1234)
+        if (
+            slug in {"lmstudio-lan-qwen", "ollama-local", "ollama"}
+            or (cat in {"compatible_http", "local_ollama"} and not api_key)
+        ) and self.lan_bridge.is_online(organization_id):
+            br = self.lan_bridge.submit_and_wait_sync(
+                organization_id=organization_id,
+                model=model_identifier,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            content = _strip_reasoning_tags(str(br.get("content") or ""))
+            in_tok = int(br.get("prompt_tokens") or max(1, len(user_prompt) // 4))
+            out_tok = int(br.get("completion_tokens") or max(1, len(content) // 4))
+            tot_tok = int(br.get("total_tokens") or (in_tok + out_tok))
+            lat_ms = int(
+                br.get("latency_ms") or max(1, int((time.perf_counter() - t0) * 1000))
+            )
+            return LLMCompletionResult(
+                content=content,
+                structured_json=_extract_json_object(content),
+                provider_slug=slug,
+                model_identifier=str(br.get("model") or model_identifier),
+                prompt_tokens=in_tok,
+                completion_tokens=out_tok,
+                total_tokens=tot_tok,
+                cost_usd=_estimate_cost_usd(
+                    provider_cfg, model_identifier, in_tok, out_tok
+                ),
+                latency_ms=lat_ms,
+                live_llm_invoked=True,
+                fallback_triggered=fallback_triggered,
+            )
 
         if slug.startswith("anthropic"):
             if not api_key:

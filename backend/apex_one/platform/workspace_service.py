@@ -753,7 +753,7 @@ class ApexPlatformService:
             interrupt_after_step=interrupt_after_step,
             llm_gateway=self.llm_gateway,
             organization_id=organization_id,
-            providers_catalog=self.model_providers.get(organization_id, []),
+            providers_catalog=self._ensure_lmstudio_lan_provider(organization_id),
         )
         self.agent_runs[run_id] = completed_run
         self._persist_run_side_effects(completed_run, user_id=user_id)
@@ -825,7 +825,7 @@ class ApexPlatformService:
             interrupt_after_step=stop_after,
             llm_gateway=self.llm_gateway,
             organization_id=organization_id,
-            providers_catalog=self.model_providers.get(organization_id, []),
+            providers_catalog=self._ensure_lmstudio_lan_provider(organization_id),
         )
         if stop_after is not None and advanced["status"] == "INTERRUPTED":
             advanced["status"] = "RUNNING"
@@ -931,7 +931,7 @@ class ApexPlatformService:
             interrupt_after_step=None,
             llm_gateway=self.llm_gateway,
             organization_id=organization_id,
-            providers_catalog=self.model_providers.get(organization_id, []),
+            providers_catalog=self._ensure_lmstudio_lan_provider(organization_id),
         )
         self.agent_runs[run_id] = resumed
         self._persist_run_side_effects(resumed, user_id=user_id)
@@ -2027,11 +2027,46 @@ class ApexPlatformService:
     # MODELS, HYBRID LOCAL NODES, WORKFLOWS, GOVERNANCE, ANALYTICS & PLUGINS
     # =========================================================================
 
+    def _ensure_lmstudio_lan_provider(self, organization_id: str) -> list[dict[str, Any]]:
+        providers = self.model_providers.setdefault(organization_id, [])
+        if not any(p.get("slug") == "lmstudio-lan-qwen" for p in providers):
+            providers.insert(
+                1 if providers else 0,
+                {
+                    "id": str(uuid.uuid4()),
+                    "organization_id": organization_id,
+                    "slug": "lmstudio-lan-qwen",
+                    "name": "LM Studio LAN (192.168.18.184:1234 · Qwen 3.6 35B-A3B)",
+                    "category": "compatible_http",
+                    "base_url": "http://192.168.18.184:1234/v1",
+                    "auth_env_var": None,
+                    "fallback_provider_slug": "apex-analytical",
+                    "rate_limit_rpm": 300,
+                    "budget_limit_usd": 0.0,
+                    "models": [
+                        {
+                            "id": "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
+                            "capabilities": [
+                                "reasoning",
+                                "structured_output",
+                                "tools",
+                                "local_lan",
+                            ],
+                            "cost_per_1k_input_usd": 0.0,
+                            "cost_per_1k_output_usd": 0.0,
+                        }
+                    ],
+                    "enabled": True,
+                },
+            )
+        return providers
+
     def list_model_providers(
         self, *, user_id: str, organization_id: str
     ) -> list[dict[str, Any]]:
         self.authorize(user_id=user_id, organization_id=organization_id)
-        providers = self.model_providers.get(organization_id, [])
+        providers = self._ensure_lmstudio_lan_provider(organization_id)
+        bridge_online = self.llm_gateway.lan_bridge.is_online(organization_id)
         enriched: list[dict[str, Any]] = []
         for p in providers:
             configured = self.llm_gateway.has_credentials(organization_id, p)
@@ -2040,8 +2075,13 @@ class ApexPlatformService:
                 if p["slug"] == "apex-analytical"
                 else ("CONFIGURED" if configured else "UNCONFIGURED_MISSING_KEY")
             )
-            if p["category"] == "local_ollama" and not configured:
-                status = "OFFLINE_IN_ARENA_SANDBOX"
+            if p["slug"] == "lmstudio-lan-qwen":
+                status = "BRIDGE_ONLINE_LAN" if bridge_online else "CONFIGURED_LAN_ENDPOINT"
+            elif p["category"] == "local_ollama":
+                if bridge_online:
+                    status = "BRIDGE_ONLINE_LAN"
+                elif not configured:
+                    status = "OFFLINE_IN_ARENA_SANDBOX"
             enriched.append({**p, "credentials_present": configured, "health_status": status})
         return enriched
 
@@ -2059,7 +2099,7 @@ class ApexPlatformService:
             organization_id=organization_id,
             required_permission="models:manage",
         )
-        providers = self.model_providers.get(organization_id, [])
+        providers = self._ensure_lmstudio_lan_provider(organization_id)
         alias_map = {
             "openai": "openai-compatible-cloud",
             "anthropic": "anthropic-cloud",
@@ -2112,7 +2152,7 @@ class ApexPlatformService:
             organization_id=organization_id,
             required_permission="models:manage",
         )
-        providers = self.model_providers.get(organization_id, [])
+        providers = self._ensure_lmstudio_lan_provider(organization_id)
         res = self.llm_gateway.complete_sync(
             organization_id=organization_id,
             providers_catalog=providers,

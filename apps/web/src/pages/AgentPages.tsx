@@ -644,7 +644,7 @@ export function RunsExecutionsPage() {
   const [projects, setProjects] = useState<any[]>([]);
   const [objective, setObjective] = useState("");
   const [mode, setMode] = useState<"multi_agent_team" | "single_agent">("multi_agent_team");
-  const [modelId, setModelId] = useState("apex-analytical-local-v1");
+  const [modelId, setModelId] = useState("qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive");
   const [projId, setProjId] = useState("");
   const [simulateInterrupt, setSimulateInterrupt] = useState(false);
   const [asyncExec, setAsyncExec] = useState(false);
@@ -746,9 +746,22 @@ export function RunsExecutionsPage() {
       />
 
       <Card>
-        <h2 className="mb-3 text-sm font-semibold text-zinc-100">
-          Uruchom Nowy Przebieg Badawczy
-        </h2>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-sm font-semibold text-zinc-100">
+            Uruchom Nowy Przebieg Badawczy
+          </h2>
+          <button
+            type="button"
+            onClick={() =>
+              setObjective(
+                "Oceń szanse spadku ceny Bitcoina (BTC/USD) w ciągu najbliższych 30 dni. Wyznacz oszacowanie prawdopodobieństwa dla trzech progów spadku: (A) korekta >= 5%, (B) korekta >= 10%, (C) głęboki spadek >= 20%. Uwzględnij zmienność zrealizowaną 30D, przepływy ETF, derywaty i czynniki makro oraz wskaż sprzeczności i przedział ufności."
+              )
+            }
+            className="rounded-full border border-indigo-400/35 bg-indigo-500/10 px-3 py-1 text-[11px] font-medium text-indigo-200 hover:bg-indigo-500/20"
+          >
+            + Wstaw test: Szansa spadku Bitcoina (BTC) w 30 dni
+          </button>
+        </div>
         <form onSubmit={handleLaunch} className="space-y-3 text-xs">
           <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
             <input

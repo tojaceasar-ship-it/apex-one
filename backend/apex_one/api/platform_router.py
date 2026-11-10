@@ -20,6 +20,7 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from apex_one.platform.governance import GovernanceBlockedError, ImmutableAuditError
+from apex_one.platform.lan_llm_bridge import build_lan_bridge_python_script
 from apex_one.platform.research_engine import InvalidResearchStateTransitionError
 from apex_one.platform.scientific_connectors import SSRFBlockedError
 from apex_one.platform.workspace_service import (
@@ -278,6 +279,18 @@ class EmergencyStopBody(BaseModel):
 
 class ToggleExtensionBody(BaseModel):
     enabled: bool
+
+
+class LanBridgePollBody(BaseModel):
+    endpoint: str = "http://192.168.18.184:1234/v1"
+    models: list[str] = Field(default_factory=list)
+    bridge_host: str = ""
+    wait_seconds: float = Field(default=10.0, ge=0.0, le=20.0)
+
+
+class LanBridgeCompleteBody(BaseModel):
+    job_id: str = Field(min_length=4)
+    result: dict[str, Any] = Field(default_factory=dict)
 
 
 def create_platform_router(get_platform: Any) -> APIRouter:
@@ -1261,6 +1274,64 @@ def create_platform_router(get_platform: Any) -> APIRouter:
                     prompt=body.prompt,
                 )
             )
+        )
+
+    @router.get("/lan-bridge/status")
+    async def get_lan_bridge_status(
+        ctx: dict[str, Any] = Depends(require_auth_context),
+    ) -> dict[str, Any]:
+        svc: ApexPlatformService = ctx["svc"]
+        return svc.llm_gateway.lan_bridge.status_snapshot(ctx["organization_id"])
+
+    @router.post("/lan-bridge/poll")
+    async def poll_lan_bridge_job(
+        body: LanBridgePollBody,
+        ctx: dict[str, Any] = Depends(require_auth_context),
+    ) -> dict[str, Any]:
+        svc: ApexPlatformService = ctx["svc"]
+        job = await svc.llm_gateway.lan_bridge.poll_next_job_async(
+            organization_id=ctx["organization_id"],
+            endpoint=body.endpoint,
+            models=body.models,
+            bridge_host=body.bridge_host,
+            wait_seconds=body.wait_seconds,
+        )
+        return {"job": job}
+
+    @router.post("/lan-bridge/complete")
+    async def complete_lan_bridge_job(
+        body: LanBridgeCompleteBody,
+        ctx: dict[str, Any] = Depends(require_auth_context),
+    ) -> dict[str, Any]:
+        svc: ApexPlatformService = ctx["svc"]
+        accepted = svc.llm_gateway.lan_bridge.complete_job(
+            organization_id=ctx["organization_id"],
+            job_id=body.job_id,
+            result_payload=body.result,
+        )
+        return {"accepted": accepted, "job_id": body.job_id}
+
+    @router.get("/lan-bridge/script.py", response_class=PlainTextResponse)
+    async def download_lan_bridge_script(
+        request: Request,
+        origin: str | None = Query(default=None),
+        lmstudio_url: str = Query(default="http://192.168.18.184:1234/v1"),
+        model: str = Query(default="qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"),
+        ctx: dict[str, Any] = Depends(require_auth_context),
+    ) -> PlainTextResponse:
+        arena_base = (origin or str(request.base_url)).rstrip("/")
+        script_body = build_lan_bridge_python_script(
+            arena_base_url=arena_base,
+            auth_token=str(ctx["raw_token"] or ""),
+            organization_id=ctx["organization_id"],
+            lmstudio_url=lmstudio_url,
+            default_model=model,
+        )
+        return PlainTextResponse(
+            content=script_body,
+            headers={
+                "Content-Disposition": 'attachment; filename="apex_lan_bridge.py"'
+            },
         )
 
     @router.get("/local-nodes/devices")

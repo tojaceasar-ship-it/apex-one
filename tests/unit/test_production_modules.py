@@ -383,3 +383,79 @@ def test_lmstudio_lan_qwen36_provider_and_think_tag_stripping() -> None:
         server.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_reverse_lan_bridge_relays_arena_preview_to_local_qwen36() -> None:
+    import asyncio
+
+    from apex_one.platform.lan_llm_bridge import build_lan_bridge_python_script
+
+    script_src = build_lan_bridge_python_script(
+        arena_base_url="https://5173-demo.e2b.app",
+        auth_token="apxsess_testtoken",
+        organization_id="org-1",
+    )
+    # Verify generated standalone Python bridge has zero syntax errors
+    compile(script_src, "apex_lan_bridge.py", "exec")
+    assert "http://192.168.18.184:1234/v1" in script_src
+    assert "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive" in script_src
+
+    svc = ApexPlatformService(seed_demo=True)
+    login = svc.login(email="admin@apex-one.local", password="ApexResearch!2026")
+    uid = login["user"]["id"]
+    oid = login["active_organization_id"]
+
+    # Register LAN bridge presence via initial short poll
+    initial = await svc.llm_gateway.lan_bridge.poll_next_job_async(
+        organization_id=oid,
+        endpoint="http://192.168.18.184:1234/v1",
+        models=["qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"],
+        bridge_host="workstation-lan",
+        wait_seconds=0.05,
+    )
+    assert initial is None
+    assert svc.llm_gateway.lan_bridge.is_online(oid) is True
+
+    providers = svc.list_model_providers(user_id=uid, organization_id=oid)
+    lmstudio = next(p for p in providers if p["slug"] == "lmstudio-lan-qwen")
+    assert lmstudio["health_status"] == "BRIDGE_ONLINE_LAN"
+
+    async def _simulated_user_pc_bridge() -> None:
+        job = await svc.llm_gateway.lan_bridge.poll_next_job_async(
+            organization_id=oid,
+            endpoint="http://192.168.18.184:1234/v1",
+            models=["qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"],
+            bridge_host="workstation-lan",
+            wait_seconds=5.0,
+        )
+        assert job is not None
+        assert job["model"] == "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"
+        svc.llm_gateway.lan_bridge.complete_job(
+            organization_id=oid,
+            job_id=job["job_id"],
+            result_payload={
+                "content": "<think>Estimating 30d volatility...</think>Szacowane prawdopodobieństwo spadku BTC >= 10% w 30 dni wynosi 38%.",
+                "model": "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
+                "prompt_tokens": 180,
+                "completion_tokens": 64,
+                "total_tokens": 244,
+                "latency_ms": 420,
+            },
+        )
+
+    bridge_task = asyncio.create_task(_simulated_user_pc_bridge())
+    infer_res = await asyncio.to_thread(
+        svc.test_model_provider_inference,
+        user_id=uid,
+        organization_id=oid,
+        model_identifier="qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
+        prompt="Oceń szanse spadku Bitcoina w ciągu 30 dni.",
+    )
+    await bridge_task
+
+    assert infer_res["live_llm_invoked"] is True
+    assert infer_res["provider_slug"] == "lmstudio-lan-qwen"
+    assert "<think>" not in infer_res["content"]
+    assert "38%" in infer_res["content"]
+
+
+

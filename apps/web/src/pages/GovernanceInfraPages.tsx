@@ -23,7 +23,7 @@ import {
   UserPlus,
   XCircle,
 } from "lucide-react";
-import { apiFetch } from "../api";
+import { apiFetch, loadStoredSession } from "../api";
 import { Badge, Card, PageHeader } from "../components/Layout";
 import { useAuth } from "../context/AuthContext";
 
@@ -179,15 +179,82 @@ export function ModelsProvidersPage() {
   );
   const [testResult, setTestResult] = useState<any>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const [bridgeStatus, setBridgeStatus] = useState<any>(null);
+  const [bridgeScriptPreview, setBridgeScriptPreview] = useState<string | null>(null);
 
   const load = async () => {
-    const res = await apiFetch("/api/v1/models/providers");
+    const [res, br] = await Promise.all([
+      apiFetch("/api/v1/models/providers"),
+      apiFetch("/api/v1/lan-bridge/status").catch(() => null),
+    ]);
     setProviders(res.items || []);
+    if (br) setBridgeStatus(br);
   };
 
   useEffect(() => {
     void load();
+    const timer = window.setInterval(() => {
+      void apiFetch("/api/v1/lan-bridge/status")
+        .then((br) => setBridgeStatus(br))
+        .catch(() => {});
+    }, 4000);
+    return () => window.clearInterval(timer);
   }, []);
+
+  const fetchBridgeScriptText = async () => {
+    const sess = loadStoredSession();
+    const origin = encodeURIComponent(window.location.origin);
+    const resp = await fetch(
+      `/api/v1/lan-bridge/script.py?origin=${origin}&lmstudio_url=${encodeURIComponent(
+        "http://192.168.18.184:1234/v1"
+      )}&model=${encodeURIComponent("qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive")}`,
+      {
+        credentials: "include",
+        headers: {
+          "X-Apex-Session-Token": sess.token || "",
+          Authorization: sess.token ? `Bearer ${sess.token}` : "",
+          "X-Organization-Id": sess.organizationId || "",
+        },
+      }
+    );
+    return await resp.text();
+  };
+
+  const handleDownloadBridgeScript = async () => {
+    const code = await fetchBridgeScriptText();
+    setBridgeScriptPreview(code);
+    try {
+      const blob = new Blob([code], { type: "text/x-python;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "apex_lan_bridge.py";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setStatusMsg(
+        "Pobrano skrypt apex_lan_bridge.py! Uruchom go na swoim komputerze: python apex_lan_bridge.py"
+      );
+    } catch {
+      setStatusMsg(
+        "Wygenerowano kod mostu LAN poniżej — skopiuj go i zapisz jako apex_lan_bridge.py."
+      );
+    }
+  };
+
+  const handleCopyBridgeScript = async () => {
+    const code = bridgeScriptPreview || (await fetchBridgeScriptText());
+    setBridgeScriptPreview(code);
+    try {
+      await navigator.clipboard.writeText(code);
+      setStatusMsg(
+        "Skopiowano cały kod apex_lan_bridge.py do schowka! Zapisz go na dysku i uruchom: python apex_lan_bridge.py"
+      );
+    } catch {
+      setStatusMsg("Zaznacz i skopiuj kod mostu LAN z pola tekstowego poniżej.");
+    }
+  };
 
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -249,6 +316,71 @@ export function ModelsProvidersPage() {
         </div>
       )}
 
+      <Card className="border-indigo-500/35 bg-gradient-to-r from-indigo-950/35 via-zinc-950/90 to-emerald-950/20">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <HardDrive className="h-4 w-4 text-indigo-400" />
+              <h2 className="text-sm font-semibold text-zinc-100">
+                Most LAN dla Arena Preview (192.168.18.184:1234 ↔ Chmura Arena)
+              </h2>
+              <Badge tone={bridgeStatus?.online ? "emerald" : "amber"}>
+                {bridgeStatus?.online
+                  ? `MOST LAN AKTYWNY (${bridgeStatus.endpoint})`
+                  : "OCZEKIWANIE NA MOST LAN"}
+              </Badge>
+            </div>
+            <p className="text-xs text-zinc-300">
+              Ponieważ podgląd Arena działa w chmurze, a Twój model{" "}
+              <code className="text-indigo-300">
+                qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive
+              </code>{" "}
+              działa w Twojej sieci domowej (<code>http://192.168.18.184:1234</code>), uruchom
+              na swoim komputerze 1-plikowy most Python (0 zależności) — automatycznie połączy
+              Arena Preview z Twoim LM Studio oraz pobierze świeże dane rynkowe BTC/USD:
+            </p>
+            {bridgeStatus?.online && (
+              <div className="text-xs text-emerald-300">
+                Host: <b>{bridgeStatus.bridge_host || "LAN"}</b> · Modele:{" "}
+                <b>{(bridgeStatus.models || []).join(", ")}</b> · Wykonane zadania LLM:{" "}
+                <b>{bridgeStatus.completed_jobs}</b>
+              </div>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-2 text-xs">
+            <button
+              type="button"
+              onClick={() => void handleDownloadBridgeScript()}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-2 font-semibold text-white hover:bg-indigo-500"
+            >
+              <Download className="h-3.5 w-3.5" />
+              Pobierz apex_lan_bridge.py
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleCopyBridgeScript()}
+              className="rounded-lg border border-zinc-700 bg-zinc-900 px-3.5 py-2 font-medium text-zinc-200 hover:border-indigo-400/50"
+            >
+              Pokaż / Skopiuj kod skryptu
+            </button>
+          </div>
+        </div>
+        {bridgeScriptPreview && (
+          <div className="mt-3 space-y-1.5">
+            <div className="text-[11px] text-zinc-400">
+              Zapisz poniższy plik na swoim komputerze jako <code>apex_lan_bridge.py</code> i
+              uruchom w terminalu / PowerShell: <code>python apex_lan_bridge.py</code>
+            </div>
+            <textarea
+              readOnly
+              rows={7}
+              value={bridgeScriptPreview}
+              className="w-full rounded-lg border border-zinc-800 bg-zinc-950 p-2.5 font-mono text-[11px] text-zinc-300"
+            />
+          </div>
+        )}
+      </Card>
+
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
         {providers.map((p) => (
           <Card key={p.id}>
@@ -264,7 +396,9 @@ export function ModelsProvidersPage() {
               </div>
               <Badge
                 tone={
-                  p.health_status.startsWith("READY") || p.health_status === "CONFIGURED"
+                  p.health_status.startsWith("READY") ||
+                  p.health_status === "CONFIGURED" ||
+                  p.health_status === "BRIDGE_ONLINE_LAN"
                     ? "emerald"
                     : "amber"
                 }

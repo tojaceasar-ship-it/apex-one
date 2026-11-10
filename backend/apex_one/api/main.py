@@ -98,6 +98,7 @@ def create_app(
             c.platform_persistence.active
             and request.method in {"POST", "PUT", "PATCH", "DELETE"}
             and request.url.path.startswith("/api/v1/")
+            and not request.url.path.startswith("/api/v1/lan-bridge/")
             and 200 <= response.status_code < 300
         ):
             await c.platform_persistence.sync_to_postgres(c.platform)
