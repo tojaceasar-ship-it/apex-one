@@ -417,7 +417,11 @@ class PostgresPlatformPersistence:
                                 "resource_type": ar.resource_type,
                                 "resource_id": ar.resource_id,
                                 "risk_level": ar.risk_level,
-                                "details": dict(ar.details_json or {}),
+                                "details": {
+                                    k: v
+                                    for k, v in dict(ar.details_json or {}).items()
+                                    if k != "_canonical_created_at"
+                                },
                                 "prev_hash": ar.prev_hash,
                                 "entry_hash": ar.entry_hash,
                                 "created_at": (
@@ -682,16 +686,18 @@ class PostgresPlatformPersistence:
         *,
         organization_id: str,
         query: str,
-        query_vector: list[float],
+        query_vector: list[float] | None = None,
+        query_embedding: list[float] | None = None,
         memory_type: str | None = None,
         project_id: str | None = None,
         scope: str | None = None,
         top_k: int = 8,
     ) -> list[dict[str, Any]]:
         """Execute real PostgreSQL pgvector HNSW cosine distance + lexical hybrid search."""
+        vec = query_embedding if query_embedding is not None else (query_vector or [])
         org_uuid = _as_uuid(organization_id)
         q_tokens = {t.lower() for t in _TOKEN_RE.findall(query)}
-        distance_expr = MemoryChunkRecord.embedding.cosine_distance(query_vector).label(
+        distance_expr = MemoryChunkRecord.embedding.cosine_distance(vec).label(
             "cosine_distance"
         )
         stmt = (
@@ -726,17 +732,21 @@ class PostgresPlatformPersistence:
             hybrid = round(0.65 * semantic_score + 0.35 * lexical, 4)
             scored.append(
                 {
+                    "id": str(chunk_row.id),
                     "chunk_id": str(chunk_row.id),
                     "memory_id": str(mem_row.id),
                     "memory_type": mem_row.memory_type,
                     "title": mem_row.title,
+                    "memory_title": mem_row.title,
                     "chunk_index": chunk_row.chunk_index,
+                    "content": chunk_row.content,
                     "excerpt": chunk_row.content[:420],
                     "source_citation": chunk_row.source_citation,
                     "source_ref": mem_row.source_ref,
                     "semantic_score": round(semantic_score, 4),
                     "lexical_score": round(lexical, 4),
                     "hybrid_score": hybrid,
+                    "score": hybrid,
                     "search_backend": "postgresql-pgvector-hnsw",
                 }
             )
