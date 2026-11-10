@@ -89,8 +89,11 @@ def upgrade() -> None:
         for idx in table.indexes:
             op.execute(sa.schema.CreateIndex(idx))
 
-    # Enforce PostgreSQL Row-Level Security on all organization_id-scoped tables
-    for stmt in build_enable_org_rls_statements(ORG_RLS_PROTECTED_TABLES):
+    # Enforce PostgreSQL Row-Level Security on all 0002 organization_id-scoped tables
+    rls_tables_0002 = tuple(
+        t for t in ORG_RLS_PROTECTED_TABLES if t not in MIGRATION_0003_TABLES
+    )
+    for stmt in build_enable_org_rls_statements(rls_tables_0002):
         op.execute(stmt)
 
     # Enforce append-only immutability on audit_events
@@ -102,7 +105,10 @@ def downgrade() -> None:
     op.execute("DROP TRIGGER IF EXISTS trg_audit_events_immutable ON audit_events")
     op.execute("DROP FUNCTION IF EXISTS prevent_audit_events_mutation()")
 
-    for stmt in build_disable_org_rls_statements(ORG_RLS_PROTECTED_TABLES):
+    rls_tables_0002 = tuple(
+        t for t in ORG_RLS_PROTECTED_TABLES if t not in MIGRATION_0003_TABLES
+    )
+    for stmt in build_disable_org_rls_statements(rls_tables_0002):
         op.execute(stmt)
 
     new_tables = [

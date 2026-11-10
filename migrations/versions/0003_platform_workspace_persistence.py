@@ -1,6 +1,6 @@
 """Durable PostgreSQL workspace & identity synchronization tables with RLS.
 
-Revision ID: 0003_platform_workspace_persistence
+Revision ID: 0003_workspace_persistence
 Revises: 0002_apex_one_complete_platform
 Create Date: 2026-11-10
 """
@@ -18,7 +18,7 @@ from apex_one.db.rls import (
     build_enable_org_rls_statements,
 )
 
-revision: str = "0003_platform_workspace_persistence"
+revision: str = "0003_workspace_persistence"
 down_revision: str | None = "0002_apex_one_complete_platform"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
