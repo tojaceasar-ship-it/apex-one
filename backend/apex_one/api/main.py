@@ -73,7 +73,8 @@ def create_app(
 
         c: AppContainer = request.app.state.container
         client_key = (
-            request.headers.get("Authorization")
+            request.headers.get("X-Apex-Session-Token")
+            or request.headers.get("Authorization")
             or (request.client.host if request.client else "local")
         )
         allowed, remaining = c.rate_limiter.check(client_key)

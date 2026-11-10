@@ -54,6 +54,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [scope, setScope] = useState<WorkspaceScope>("all");
   const [locale, setLocaleState] = useState<Locale>("pl");
 
+  const syncProfilePayload = useCallback((me: any) => {
+    const stored = loadStoredSession();
+    setUser(me.user);
+    const activeId = me.active_organization_id || stored.organizationId;
+    const orgList: UserOrgSummary[] = me.organizations || [];
+    const matchedOrg = orgList.find((o) => o.organization_id === activeId) || orgList[0];
+    setRole(me.role || matchedOrg?.role || "Owner");
+    setOrganizations(orgList);
+    setActiveOrgId(activeId);
+    if (me.user?.locale === "en" || me.user?.locale === "pl") {
+      setLocaleState(me.user.locale);
+    }
+    saveStoredSession({
+      ...stored,
+      organizationId: activeId,
+    });
+  }, []);
+
   const refreshProfile = useCallback(async () => {
     const stored = loadStoredSession();
     if (!stored.token) {
@@ -63,24 +81,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
     try {
       const me = await apiFetch("/api/v1/auth/me");
-      setUser(me.user);
-      setRole(me.role);
-      setOrganizations(me.organizations || []);
-      setActiveOrgId(me.active_organization_id);
-      if (me.user?.locale === "en" || me.user?.locale === "pl") {
-        setLocaleState(me.user.locale);
-      }
-      saveStoredSession({
-        ...stored,
-        organizationId: me.active_organization_id,
-      });
+      syncProfilePayload(me);
     } catch {
       clearStoredSession();
       setUser(null);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [syncProfilePayload]);
 
   useEffect(() => {
     void refreshProfile();
@@ -96,7 +104,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       csrfToken: res.csrf_token,
       organizationId: res.active_organization_id,
     });
-    await refreshProfile();
+    // Populate user profile immediately from login response so navigation to "/" succeeds
+    syncProfilePayload(res);
+    setLoading(false);
+
+    // Confirm session round-trip; surface error explicitly if proxy/session check fails
+    try {
+      const me = await apiFetch("/api/v1/auth/me");
+      syncProfilePayload(me);
+    } catch (err) {
+      clearStoredSession();
+      setUser(null);
+      throw err;
+    }
   };
 
   const registerAccount = async (payload: {

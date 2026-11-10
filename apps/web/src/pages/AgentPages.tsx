@@ -690,7 +690,9 @@ export function RunsExecutionsPage() {
     setStreamEvents([]);
     const sess = loadStoredSession();
     const res = await fetch(`/api/v1/runs/${runId}/stream`, {
+      credentials: "include",
       headers: {
+        "X-Apex-Session-Token": sess.token || "",
         Authorization: sess.token ? `Bearer ${sess.token}` : "",
         "X-Organization-Id": sess.organizationId || "",
       },

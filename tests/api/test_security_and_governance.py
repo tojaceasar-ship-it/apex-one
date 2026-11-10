@@ -180,3 +180,31 @@ async def test_sliding_window_rate_limiter_enforces_429() -> None:
         limited = await client.get("/api/v1/health")
         assert limited.status_code == 429
         assert limited.json()["error"]["code"] == "RATE_LIMITED"
+
+
+async def test_cloud_preview_proxy_rewritten_authorization_header_login() -> None:
+    app = create_app(Settings(env="development"), seed_demo=True)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        login = await client.post(
+            "/api/v1/auth/login",
+            headers={"X-Forwarded-Proto": "https"},
+            json={"email": "admin@apex-one.local", "password": "ApexResearch!2026"},
+        )
+        assert login.status_code == 200
+        set_cookie = login.headers.get("set-cookie", "").lower()
+        assert "samesite=none" in set_cookie
+        assert "secure" in set_cookie
+        token = login.json()["access_token"]
+
+        # Simulate cloud preview proxy overwriting Authorization with its own JWT
+        me_res = await client.get(
+            "/api/v1/auth/me",
+            headers={
+                "Authorization": "Bearer eyJhbGciOiJIUzI1NiJ9.proxy.injected",
+                "X-Apex-Session-Token": token,
+            },
+        )
+        assert me_res.status_code == 200
+        assert me_res.json()["user"]["email"] == "admin@apex-one.local"
+

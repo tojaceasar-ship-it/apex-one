@@ -257,6 +257,7 @@ def create_platform_router(get_platform: Any) -> APIRouter:
     def require_auth_context(
         request: Request,
         authorization: str | None = Header(default=None),
+        x_apex_session_token: str | None = Header(default=None),
         x_organization_id: str | None = Header(default=None),
         x_csrf_token: str | None = Header(default=None),
         apx_session: str | None = Cookie(default=None),
@@ -264,11 +265,23 @@ def create_platform_router(get_platform: Any) -> APIRouter:
         svc: ApexPlatformService = get_platform()
         token: str | None = None
         used_cookie = False
-        if authorization and authorization.lower().startswith("bearer "):
-            token = authorization[7:].strip()
+
+        apex_header_token = (x_apex_session_token or "").strip()
+        bearer_token = (
+            authorization[7:].strip()
+            if authorization and authorization.lower().startswith("bearer ")
+            else ""
+        )
+
+        if apex_header_token:
+            token = apex_header_token
+        elif bearer_token and bearer_token.startswith(("apxsess_", "apxkey_")):
+            token = bearer_token
         elif apx_session:
             token = apx_session
             used_cookie = True
+        elif bearer_token:
+            token = bearer_token
 
         try:
             ctx = svc.authenticate_token(token)
@@ -355,7 +368,11 @@ def create_platform_router(get_platform: Any) -> APIRouter:
         )
 
     @router.post("/auth/login")
-    async def login(body: LoginBody, response: Response) -> dict[str, Any]:
+    async def login(
+        body: LoginBody,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
         svc: ApexPlatformService = get_platform()
         try:
             res = svc.login(email=body.email, password=body.password)
@@ -364,11 +381,16 @@ def create_platform_router(get_platform: Any) -> APIRouter:
                 status_code=401,
                 detail={"code": "INVALID_CREDENTIALS", "message": str(exc)},
             ) from exc
+        forwarded_proto = (
+            request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+        )
+        is_https = request.url.scheme == "https" or forwarded_proto == "https"
         response.set_cookie(
             key="apx_session",
             value=res["access_token"],
             httponly=True,
-            samesite="lax",
+            secure=is_https,
+            samesite="none" if is_https else "lax",
             max_age=43200,
         )
         return res

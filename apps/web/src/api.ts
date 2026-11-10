@@ -2,6 +2,12 @@
  * Browser-safe relative `/api/v1` client for APEX ONE Workbench.
  * Never calls localhost/127.0.0.1 directly from the browser so Vite preview
  * proxying works seamlessly in both local and cloud preview environments.
+ *
+ * Includes:
+ * - In-memory session fallback when third-party iframe storage (`localStorage`)
+ *   is restricted by browser privacy settings.
+ * - `X-Apex-Session-Token` header alongside `Authorization: Bearer` so cloud
+ *   preview reverse proxies that rewrite `Authorization` never break login.
  */
 
 export interface ApiSessionState {
@@ -12,25 +18,49 @@ export interface ApiSessionState {
 
 const STORAGE_KEY = "apex_one_session_v1";
 
+let memorySession: ApiSessionState = {
+  token: null,
+  csrfToken: null,
+  organizationId: null,
+};
+
 export function loadStoredSession(): ApiSessionState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { token: null, csrfToken: null, organizationId: null };
-    return JSON.parse(raw) as ApiSessionState;
+    if (raw) {
+      const parsed = JSON.parse(raw) as ApiSessionState;
+      memorySession = {
+        token: parsed.token ?? null,
+        csrfToken: parsed.csrfToken ?? null,
+        organizationId: parsed.organizationId ?? null,
+      };
+      return { ...memorySession };
+    }
   } catch {
-    return { token: null, csrfToken: null, organizationId: null };
+    // Fallback to in-memory session inside strict sandboxed iframes
   }
+  return { ...memorySession };
 }
 
 export function saveStoredSession(state: ApiSessionState): void {
+  memorySession = {
+    token: state.token ?? null,
+    csrfToken: state.csrfToken ?? null,
+    organizationId: state.organizationId ?? null,
+  };
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(memorySession));
   } catch {
-    // ignore storage quota errors
+    // In-memory session remains active even if localStorage is blocked
   }
 }
 
 export function clearStoredSession(): void {
+  memorySession = {
+    token: null,
+    csrfToken: null,
+    organizationId: null,
+  };
   try {
     localStorage.removeItem(STORAGE_KEY);
   } catch {
@@ -64,6 +94,7 @@ export async function apiFetch<T = any>(
     headers.set("Content-Type", "application/json");
   }
   if (sess.token) {
+    headers.set("X-Apex-Session-Token", sess.token);
     headers.set("Authorization", `Bearer ${sess.token}`);
   }
   if (sess.organizationId) {
@@ -85,7 +116,10 @@ export async function apiFetch<T = any>(
     let code = `HTTP_${res.status}`;
     try {
       const errJson = await res.json();
-      msg = errJson?.error?.message || errJson?.detail?.message || JSON.stringify(errJson.detail || errJson);
+      msg =
+        errJson?.error?.message ||
+        errJson?.detail?.message ||
+        JSON.stringify(errJson.detail || errJson);
       code = errJson?.error?.code || errJson?.detail?.code || code;
     } catch {
       msg = (await res.text()) || msg;
