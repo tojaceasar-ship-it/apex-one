@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 
 from apex_one.db.adapter import PostgresConnectionAdapter
 from apex_one.db.base import utcnow
@@ -33,6 +33,7 @@ from apex_one.db.platform_models import (
     PlatformIdentityDirectoryRecord,
     User,
 )
+from apex_one.platform.concurrency import StaleWriteConflictError
 
 if TYPE_CHECKING:
     from apex_one.platform.workspace_service import ApexPlatformService
@@ -216,7 +217,22 @@ def export_org_bundle(svc: ApexPlatformService, org_id: str) -> dict[str, Any]:
         "usage_records": [
             u for u in svc.usage_records if u.get("organization_id") == org_id
         ],
+        "call_attribution_records": [
+            c
+            for c in getattr(svc, "call_attribution_records", [])
+            if c.get("organization_id") == org_id
+        ],
+        "idempotency_entries": (
+            svc.idempotency_ledger.export_org_entries(org_id)
+            if hasattr(svc, "idempotency_ledger")
+            else []
+        ),
         "model_providers": svc.model_providers.get(org_id, []),
+        "memory_index_config": svc.memory_index_configs.get(org_id),
+        "memory_reindex_history": svc.memory_reindex_history.get(org_id, []),
+        "owner_trusted_local_origins": sorted(
+            svc.llm_gateway._owner_trusted_origins.get(org_id, set())
+        ),
         "extensions": svc.extensions.get(org_id, []),
         "l3_data_cache_records": {
             k: v
@@ -267,6 +283,8 @@ def _reset_service_collections(svc: ApexPlatformService) -> None:
     svc.approvals.clear()
     svc.budgets.clear()
     svc.usage_records.clear()
+    if hasattr(svc, "call_attribution_records"):
+        svc.call_attribution_records.clear()
     svc.model_providers.clear()
     svc.extensions.clear()
     svc.l3_data_cache_records.clear()
@@ -307,13 +325,18 @@ class PostgresPlatformPersistence:
                 return False
 
             if ident_row is None or not org_rows:
-                # Empty database: persist initial workspace state into PostgreSQL
+                # Empty database: activate persistence; write initial state ONLY if non-empty
                 self.active = True
-                await self._write_all_unlocked(svc)
+                if svc.organizations:
+                    await self._write_all_unlocked(svc)
                 return True
 
             # Existing database: hydrate in-memory coordinator from PostgreSQL
             _reset_service_collections(svc)
+            svc._identity_state_version = int(
+                getattr(ident_row, "version_num", 1) or 1
+            )
+            svc._org_state_versions = {}
             ident = dict(ident_row.identity_json or {})
             svc.default_org_id = str(ident.get("default_org_id") or "")
             svc.users.update(ident.get("users") or {})
@@ -338,6 +361,9 @@ class PostgresPlatformPersistence:
                         OrganizationWorkspaceStateRecord, org_uuid
                     )
                     if ws_row and ws_row.state_json:
+                        svc._org_state_versions[org_id] = int(
+                            getattr(ws_row, "version_num", 1) or 1
+                        )
                         b = ws_row.state_json
                         svc.memberships.extend(b.get("memberships") or [])
                         svc.invitations.update(b.get("invitations") or {})
@@ -375,9 +401,31 @@ class PostgresPlatformPersistence:
                         svc.approvals.update(b.get("approvals") or {})
                         svc.budgets[org_id] = list(b.get("budgets") or [])
                         svc.usage_records.extend(b.get("usage_records") or [])
+                        if hasattr(svc, "call_attribution_records"):
+                            svc.call_attribution_records.extend(
+                                b.get("call_attribution_records") or []
+                            )
+                        if hasattr(svc, "idempotency_ledger") and b.get(
+                            "idempotency_entries"
+                        ):
+                            svc.idempotency_ledger.hydrate_org_entries(
+                                org_id, list(b.get("idempotency_entries") or [])
+                            )
                         svc.model_providers[org_id] = list(
                             b.get("model_providers") or []
                         )
+                        if b.get("memory_index_config"):
+                            svc.memory_index_configs[org_id] = dict(
+                                b["memory_index_config"]
+                            )
+                        if b.get("memory_reindex_history"):
+                            svc.memory_reindex_history[org_id] = list(
+                                b["memory_reindex_history"]
+                            )
+                        if b.get("owner_trusted_local_origins"):
+                            svc.llm_gateway._owner_trusted_origins[org_id] = set(
+                                b.get("owner_trusted_local_origins") or []
+                            )
                         svc.extensions[org_id] = list(b.get("extensions") or [])
                         svc.l3_data_cache_records.update(
                             b.get("l3_data_cache_records") or {}
@@ -531,20 +579,59 @@ class PostgresPlatformPersistence:
                 sys_session.add(
                     PlatformIdentityDirectoryRecord(
                         singleton_key=IDENTITY_SINGLETON_KEY,
+                        version_num=1,
                         identity_json=ident_payload,
                     )
                 )
+                svc._identity_state_version = 1
             else:
-                ident_row.identity_json = ident_payload
-                ident_row.updated_at = now
+                expected_ident_ver = getattr(svc, "_identity_state_version", None)
+                db_ident_ver = int(getattr(ident_row, "version_num", 1) or 1)
+                if (
+                    expected_ident_ver is not None
+                    and int(expected_ident_ver) != db_ident_ver
+                ):
+                    raise StaleWriteConflictError(
+                        "PlatformIdentityDirectory",
+                        IDENTITY_SINGLETON_KEY,
+                        expected_version=int(expected_ident_ver),
+                        actual_version=db_ident_ver,
+                    )
+                next_ident_ver = db_ident_ver + 1
+                res_ident = await sys_session.execute(
+                    update(PlatformIdentityDirectoryRecord)
+                    .where(
+                        PlatformIdentityDirectoryRecord.singleton_key
+                        == IDENTITY_SINGLETON_KEY,
+                        PlatformIdentityDirectoryRecord.version_num == db_ident_ver,
+                    )
+                    .values(
+                        identity_json=ident_payload,
+                        version_num=next_ident_ver,
+                        updated_at=now,
+                    )
+                )
+                if res_ident.rowcount == 0:
+                    raise StaleWriteConflictError(
+                        "PlatformIdentityDirectory",
+                        IDENTITY_SINGLETON_KEY,
+                        expected_version=db_ident_ver,
+                        actual_version=None,
+                    )
+                svc._identity_state_version = next_ident_ver
 
-        # 2. Per-organization RLS-enforced synchronization
+        # 2. Per-organization RLS-enforced synchronization with Optimistic Concurrency Control
+        org_versions = getattr(svc, "_org_state_versions", None)
+        if org_versions is None:
+            org_versions = {}
+            svc._org_state_versions = org_versions
+
         for oid in list(svc.organizations.keys()):
             org_uuid = _as_uuid(oid)
             org_bundle = export_org_bundle(svc, oid)
 
             async with self._adapter.session_with_rls(org_uuid) as org_session:
-                # 2a. Workspace state record (RLS-protected)
+                # 2a. Workspace state record (RLS-protected + OCC compare-and-swap)
                 ws_row = await org_session.get(
                     OrganizationWorkspaceStateRecord, org_uuid
                 )
@@ -552,12 +639,46 @@ class PostgresPlatformPersistence:
                     org_session.add(
                         OrganizationWorkspaceStateRecord(
                             organization_id=org_uuid,
+                            version_num=1,
                             state_json=org_bundle,
                         )
                     )
+                    org_versions[oid] = 1
                 else:
-                    ws_row.state_json = org_bundle
-                    ws_row.updated_at = now
+                    db_ws_ver = int(getattr(ws_row, "version_num", 1) or 1)
+                    expected_ws_ver = org_versions.get(oid)
+                    if (
+                        expected_ws_ver is not None
+                        and int(expected_ws_ver) != db_ws_ver
+                    ):
+                        raise StaleWriteConflictError(
+                            "OrganizationWorkspaceState",
+                            oid,
+                            expected_version=int(expected_ws_ver),
+                            actual_version=db_ws_ver,
+                        )
+                    next_ws_ver = db_ws_ver + 1
+                    res_ws = await org_session.execute(
+                        update(OrganizationWorkspaceStateRecord)
+                        .where(
+                            OrganizationWorkspaceStateRecord.organization_id
+                            == org_uuid,
+                            OrganizationWorkspaceStateRecord.version_num == db_ws_ver,
+                        )
+                        .values(
+                            state_json=org_bundle,
+                            version_num=next_ws_ver,
+                            updated_at=now,
+                        )
+                    )
+                    if res_ws.rowcount == 0:
+                        raise StaleWriteConflictError(
+                            "OrganizationWorkspaceState",
+                            oid,
+                            expected_version=db_ws_ver,
+                            actual_version=None,
+                        )
+                    org_versions[oid] = next_ws_ver
 
                 # 2b. Relational `research_projects`
                 for pid, proj in org_bundle["projects"].items():

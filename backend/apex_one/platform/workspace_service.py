@@ -9,14 +9,19 @@ Tamper-Evident Audit Log, Analytics, and Extension Registry.
 
 from __future__ import annotations
 
+import copy
 import csv
 import io
 import json
 import os
+import re
+import threading
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from apex_one.db.base import utcnow
@@ -26,7 +31,21 @@ from apex_one.integrations_hub import (
     check_web_search_health,
     create_integration_placeholders,
 )
+from apex_one.platform.concurrency import (
+    RequestIdempotencyLedger,
+    StaleWriteConflictError,
+    atomic_read_json_checkpoint,
+    atomic_write_json_checkpoint,
+    check_and_bump_version,
+)
+from apex_one.platform.cost_attribution import (
+    CallCostAttributionRecord,
+    aggregate_workflow_cost_attribution,
+    build_call_attribution_record,
+)
 from apex_one.platform.experiments_and_eval import (
+    assert_benchmark_symmetry,
+    build_blind_benchmark_sources,
     compute_dataset_checksum,
     execute_controlled_experiment_protocol,
     score_evaluation_run,
@@ -38,7 +57,7 @@ from apex_one.platform.governance import (
     compute_approval_parameter_hash,
     default_approval_expiry,
 )
-from apex_one.platform.llm_gateway import LLMGateway
+from apex_one.platform.llm_gateway import LLMGateway, classify_provider_trust_class
 from apex_one.platform.local_intelligence import (
     BUILTIN_AGENT_CONTRACTS,
     ExecutionRouter,
@@ -54,6 +73,9 @@ from apex_one.platform.local_intelligence import (
 )
 from apex_one.platform.memory_and_docs import (
     VALID_MEMORY_TYPES,
+    EmbeddingSpaceMetadata,
+    assert_compatible_embedding_spaces,
+    build_local_deterministic_space,
     chunk_document_text,
     extract_document_text,
     rank_memory_chunks,
@@ -84,6 +106,7 @@ from apex_one.platform.security import (
     sha256_hex,
     verify_password,
 )
+from apex_one.platform.ssrf_guard import EndpointTrustClass, resolve_and_validate_url
 
 
 class AuthorizationError(PermissionError):
@@ -97,10 +120,24 @@ class ResourceNotFoundError(LookupError):
 class ApexPlatformService:
     """Authoritative multi-tenant domain coordinator for APEX ONE 1.0."""
 
-    def __init__(self, *, repo_root: Path | None = None, seed_demo: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        repo_root: Path | None = None,
+        seed_demo: bool = False,
+        env: str | None = None,
+        llm_gateway: LLMGateway | None = None,
+    ) -> None:
+        resolved_env = (env or os.environ.get("APEX_ENV", "development")).strip().lower()
+        if seed_demo and resolved_env not in {"development", "test"}:
+            raise ValueError(
+                f"Demo seeding is strictly forbidden in '{resolved_env}' environment."
+            )
+        self._env_profile: str = resolved_env
+        self.demo_seeded: bool = False
         self._repo_root = repo_root or Path(__file__).resolve().parents[3]
         self._runtime = DurableCheckpointRuntimeAdapter()
-        self.llm_gateway = LLMGateway()
+        self.llm_gateway = llm_gateway or LLMGateway()
         self.audit = TamperEvidentAuditLedger()
 
         # Multi-tenant state stores keyed cleanly with mandatory organization_id checks
@@ -133,6 +170,8 @@ class ApexPlatformService:
 
         self.memories: dict[str, dict[str, Any]] = {}
         self.memory_chunks: dict[str, list[dict[str, Any]]] = {}
+        self.memory_index_configs: dict[str, dict[str, Any]] = {}
+        self.memory_reindex_history: dict[str, list[dict[str, Any]]] = {}
 
         self.datasets: dict[str, dict[str, Any]] = {}
         self.dataset_versions: dict[str, list[dict[str, Any]]] = {}
@@ -150,10 +189,15 @@ class ApexPlatformService:
         self.approvals: dict[str, dict[str, Any]] = {}
         self.budgets: dict[str, list[dict[str, Any]]] = {}
         self.usage_records: list[dict[str, Any]] = []
+        self.call_attribution_records: list[dict[str, Any]] = []
         self.model_providers: dict[str, list[dict[str, Any]]] = {}
         self.extensions: dict[str, list[dict[str, Any]]] = {}
         self.l3_data_cache_records: dict[str, dict[str, Any]] = {}
         self.execution_telemetry_log: list[dict[str, Any]] = []
+        self.idempotency_ledger = RequestIdempotencyLedger()
+        self._identity_state_version: int = 1
+        self._org_state_versions: dict[str, int] = {}
+        self._mutation_lock = threading.RLock()
 
         self.data_cache = MultiTierDataCache(
             l2_file_path=os.environ.get("APEX_L2_CACHE_FILE"),
@@ -195,6 +239,8 @@ class ApexPlatformService:
         "evidence",
         "memories",
         "memory_chunks",
+        "memory_index_configs",
+        "memory_reindex_history",
         "datasets",
         "dataset_versions",
         "experiments",
@@ -209,6 +255,7 @@ class ApexPlatformService:
         "approvals",
         "budgets",
         "usage_records",
+        "call_attribution_records",
         "model_providers",
         "extensions",
         "l3_data_cache_records",
@@ -217,37 +264,75 @@ class ApexPlatformService:
     )
 
     def save_local_checkpoint(self, file_path: Path) -> None:
-        from dataclasses import asdict
-
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        payload: dict[str, Any] = {
-            k: getattr(self, k) for k in self._CHECKPOINT_FIELDS
-        }
-        payload["_audit_by_org"] = {
-            org_id: [asdict(e) for e in self.audit.get_chronological_entries(org_id)]
-            for org_id in self.organizations
-        }
-        tmp = file_path.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8"
-        )
-        tmp.replace(file_path)
+        with self._mutation_lock:
+            payload: dict[str, Any] = {
+                k: copy.deepcopy(getattr(self, k)) for k in self._CHECKPOINT_FIELDS
+            }
+            payload["_audit_by_org"] = {
+                org_id: [asdict(e) for e in self.audit.get_chronological_entries(org_id)]
+                for org_id in self.organizations
+            }
+            payload["_idempotency_by_org"] = {
+                org_id: self.idempotency_ledger.export_org_entries(org_id)
+                for org_id in self.organizations
+            }
+            payload["_org_state_versions"] = dict(self._org_state_versions)
+            payload["_identity_state_version"] = int(self._identity_state_version)
+            atomic_write_json_checkpoint(file_path, payload)
 
     def load_local_checkpoint(self, file_path: Path) -> bool:
-        if not file_path.exists():
-            return False
-        try:
-            payload = json.loads(file_path.read_text(encoding="utf-8"))
-            for k in self._CHECKPOINT_FIELDS:
-                if k in payload:
-                    setattr(self, k, payload[k])
-            for org_id, entries in (payload.get("_audit_by_org") or {}).items():
-                self.audit.hydrate_org_entries(org_id, entries)
-            self.data_cache.bind_l3_store(self.l3_data_cache_records)
-            self.telemetry_ledger.bind_store(self.execution_telemetry_log)
-            return True
-        except Exception:
-            return False
+        with self._mutation_lock:
+            payload = atomic_read_json_checkpoint(file_path)
+            if payload is None:
+                return False
+            try:
+                for k in self._CHECKPOINT_FIELDS:
+                    if k in payload:
+                        setattr(self, k, payload[k])
+                for org_id, entries in (payload.get("_audit_by_org") or {}).items():
+                    self.audit.hydrate_org_entries(org_id, entries)
+                for org_id, idem_rows in (payload.get("_idempotency_by_org") or {}).items():
+                    self.idempotency_ledger.hydrate_org_entries(org_id, idem_rows)
+                if isinstance(payload.get("_org_state_versions"), dict):
+                    self._org_state_versions = {
+                        str(k): int(v)
+                        for k, v in payload["_org_state_versions"].items()
+                    }
+                if payload.get("_identity_state_version") is not None:
+                    self._identity_state_version = int(
+                        payload["_identity_state_version"]
+                    )
+                self.data_cache.bind_l3_store(self.l3_data_cache_records)
+                self.telemetry_ledger.bind_store(self.execution_telemetry_log)
+                return True
+            except Exception:
+                return False
+
+    @contextmanager
+    def transactional_org_mutation(self, organization_id: str) -> Iterator[None]:
+        """Execute a multi-step tenant mutation atomically, rolling back in-memory state on error."""
+        with self._mutation_lock:
+            snapshot_fields = {
+                k: copy.deepcopy(getattr(self, k)) for k in self._CHECKPOINT_FIELDS
+            }
+            audit_snap = [
+                asdict(e)
+                for e in self.audit.get_chronological_entries(organization_id)
+            ]
+            org_ver_snap = dict(self._org_state_versions)
+            try:
+                yield
+                self._org_state_versions[organization_id] = (
+                    int(self._org_state_versions.get(organization_id, 1)) + 1
+                )
+            except Exception:
+                for k, val in snapshot_fields.items():
+                    setattr(self, k, val)
+                self.audit.hydrate_org_entries(organization_id, audit_snap)
+                self._org_state_versions = org_ver_snap
+                self.data_cache.bind_l3_store(self.l3_data_cache_records)
+                self.telemetry_ledger.bind_store(self.execution_telemetry_log)
+                raise
 
     # =========================================================================
     # IDENTITY, AUTHENTICATION & STRICT MULTI-TENANT AUTHORIZATION
@@ -654,27 +739,38 @@ class ApexPlatformService:
         agent_id: str,
         updates: dict[str, Any],
         change_summary: str = "Updated AgentDNA configuration",
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
-        """Modify an agent by appending an immutable new AgentDNA version (never overwrites history)."""
+        """Modify an agent by appending an immutable new AgentDNA version (with OCC version check)."""
         self.authorize(
             user_id=user_id,
             organization_id=organization_id,
             required_permission="agents:write",
         )
-        agent = self._require_org_entity(self.agents, agent_id, organization_id, "Agent")
-        merged_source = {**agent["dna"], **agent, **updates}
-        new_dna = self._normalize_agent_dna(merged_source)
-        next_ver = int(agent["current_version"]) + 1
-        now = utcnow().isoformat()
+        with self._mutation_lock:
+            agent = self._require_org_entity(self.agents, agent_id, organization_id, "Agent")
+            cur_ver = int(agent["current_version"])
+            if expected_version is not None and int(expected_version) != cur_ver:
+                raise StaleWriteConflictError(
+                    "Agent",
+                    agent_id,
+                    expected_version=int(expected_version),
+                    actual_version=cur_ver,
+                )
+            merged_source = {**agent["dna"], **agent, **updates}
+            new_dna = self._normalize_agent_dna(merged_source)
+            next_ver = cur_ver + 1
+            now = utcnow().isoformat()
 
-        agent["name"] = updates.get("name", agent["name"])
-        agent["description"] = updates.get("description", agent["description"])
-        agent["role"] = updates.get("role", agent["role"])
-        agent["purpose"] = updates.get("purpose", agent["purpose"])
-        agent["status"] = updates.get("status", agent["status"])
-        agent["current_version"] = next_ver
-        agent["dna"] = new_dna
-        agent["updated_at"] = now
+            agent["name"] = updates.get("name", agent["name"])
+            agent["description"] = updates.get("description", agent["description"])
+            agent["role"] = updates.get("role", agent["role"])
+            agent["purpose"] = updates.get("purpose", agent["purpose"])
+            agent["status"] = updates.get("status", agent["status"])
+            agent["current_version"] = next_ver
+            agent["version"] = next_ver
+            agent["dna"] = new_dna
+            agent["updated_at"] = now
 
         self.agent_versions.setdefault(agent_id, []).append(
             {
@@ -820,6 +916,8 @@ class ApexPlatformService:
         workspace_scope: str = "research",
         model_identifier: str = "apex-analytical-local-v1",
         auto_discover_sources: bool = False,
+        override_sources: list[dict[str, Any]] | None = None,
+        benchmark_blind_mode: bool = False,
     ) -> dict[str, Any]:
         self.authorize(
             user_id=user_id,
@@ -828,7 +926,7 @@ class ApexPlatformService:
         )
         self._enforce_operational_guards(organization_id)
 
-        if auto_discover_sources:
+        if auto_discover_sources and override_sources is None:
             self.auto_ingest_discovered_sources(
                 user_id=user_id,
                 organization_id=organization_id,
@@ -847,10 +945,15 @@ class ApexPlatformService:
             workspace_scope=workspace_scope,
             model_identifier=model_identifier,
         )
+        if benchmark_blind_mode:
+            initial_run["benchmark_blind_mode"] = True
         run_id = initial_run["id"]
-        project_sources, agents_by_slug = self._resolve_run_context(
+        default_sources, agents_by_slug = self._resolve_run_context(
             organization_id=organization_id,
             research_project_id=research_project_id,
+        )
+        project_sources = (
+            list(override_sources) if override_sources is not None else default_sources
         )
 
         completed_run = self._runtime.execute_or_resume_run(
@@ -1160,30 +1263,40 @@ class ApexPlatformService:
         organization_id: str,
         project_id: str,
         target_state: str,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         self.authorize(
             user_id=user_id,
             organization_id=organization_id,
             required_permission="research:write",
         )
-        proj = self._require_org_entity(
-            self.projects, project_id, organization_id, "ResearchProject"
-        )
-        validated = validate_research_state_transition(proj["state"], target_state)
-        proj["state"] = validated.value
-        proj["version"] = int(proj["version"]) + 1
-        proj["updated_at"] = utcnow().isoformat()
-        self.audit.append(
-            organization_id=organization_id,
-            actor_id=user_id,
-            actor_type="user",
-            action="research.transition_state",
-            resource_type="research_project",
-            resource_id=project_id,
-            risk_level="R1",
-            details={"target_state": validated.value},
-        )
-        return proj
+        with self._mutation_lock:
+            proj = self._require_org_entity(
+                self.projects, project_id, organization_id, "ResearchProject"
+            )
+            cur_ver = int(proj.get("version", 1))
+            if expected_version is not None and int(expected_version) != cur_ver:
+                raise StaleWriteConflictError(
+                    "ResearchProject",
+                    project_id,
+                    expected_version=int(expected_version),
+                    actual_version=cur_ver,
+                )
+            validated = validate_research_state_transition(proj["state"], target_state)
+            proj["state"] = validated.value
+            proj["version"] = cur_ver + 1
+            proj["updated_at"] = utcnow().isoformat()
+            self.audit.append(
+                organization_id=organization_id,
+                actor_id=user_id,
+                actor_type="user",
+                action="research.transition_state",
+                resource_type="research_project",
+                resource_id=project_id,
+                risk_level="R1",
+                details={"target_state": validated.value, "version": proj["version"]},
+            )
+            return proj
 
     def upsert_research_brief_and_questions(
         self,
@@ -1319,11 +1432,29 @@ class ApexPlatformService:
         if stype not in {"URL", "PDF", "DOCX", "TXT", "MD"}:
             raise ValueError(f"Unsupported source_type '{source_type}'.")
 
+        # Sanitize filename against path traversal / null bytes when not an HTTP(S) URL
+        safe_uri_or_filename = uri_or_filename.replace("\x00", "").strip()
+        if stype != "URL":
+            normalized_slashes = safe_uri_or_filename.replace("\\", "/")
+            base_name = PurePosixPath(normalized_slashes).name
+            safe_uri_or_filename = re.sub(r"[^A-Za-z0-9._\- ]+", "_", base_name).strip(" .")
+            if not safe_uri_or_filename:
+                safe_uri_or_filename = f"uploaded_source.{stype.lower()}"
+
+        # Enforce 10 MiB upload payload cap before decoding / indexing
+        max_upload_bytes = 10 * 1024 * 1024
+        if raw_text and len(raw_text.encode("utf-8", errors="replace")) > max_upload_bytes:
+            raise ValueError("Source payload exceeds maximum allowed size (10 MiB).")
+        if content_base64 and len(content_base64) > (max_upload_bytes * 4) // 3 + 64:
+            raise ValueError("Base64 source payload exceeds maximum allowed size (10 MiB).")
+
         extracted_text, raw_bytes = extract_document_text(
             source_type=stype,
             raw_text=raw_text,
             content_base64=content_base64,
         )
+        if len(raw_bytes) > max_upload_bytes:
+            raise ValueError("Decoded source payload exceeds maximum allowed size (10 MiB).")
         safety = inspect_untrusted_document(extracted_text)
         checksum = sha256_hex(raw_bytes)
 
@@ -1356,7 +1487,7 @@ class ApexPlatformService:
             "research_project_id": research_project_id,
             "source_type": stype,
             "title": title,
-            "uri_or_filename": uri_or_filename,
+            "uri_or_filename": safe_uri_or_filename,
             "authors": authors or [],
             "published_at": published_at,
             "retrieved_at": now,
@@ -1811,6 +1942,7 @@ class ApexPlatformService:
         organization_id: str,
         claim_id: str,
         status: str,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         self.authorize(
             user_id=user_id,
@@ -1819,9 +1951,17 @@ class ApexPlatformService:
         )
         if status not in VALID_CLAIM_STATUSES:
             raise ValueError(f"Unsupported claim status '{status}'.")
-        claim = self._require_org_entity(self.claims, claim_id, organization_id, "Claim")
-        claim["status"] = status
-        return claim
+        with self._mutation_lock:
+            claim = self._require_org_entity(self.claims, claim_id, organization_id, "Claim")
+            check_and_bump_version(
+                claim,
+                resource_type="Claim",
+                resource_id=claim_id,
+                expected_version=expected_version,
+            )
+            claim["status"] = status
+            claim["updated_at"] = utcnow().isoformat()
+            return claim
 
     def get_evidence_graph(
         self,
@@ -1901,6 +2041,33 @@ class ApexPlatformService:
         self._index_memory_chunks(mem)
         return {**mem, "chunk_count": len(self.memory_chunks.get(mid, []))}
 
+    def get_active_embedding_space(
+        self, organization_id: str
+    ) -> EmbeddingSpaceMetadata:
+        raw = self.memory_index_configs.get(organization_id)
+        if isinstance(raw, dict) and raw.get("embedding_model"):
+            return EmbeddingSpaceMetadata.from_dict(raw)
+        default_space = build_local_deterministic_space(
+            created_at=utcnow().isoformat()
+        )
+        self.memory_index_configs[organization_id] = default_space.to_dict()
+        return default_space
+
+    def embed_query_for_active_index(
+        self,
+        *,
+        organization_id: str,
+        query: str,
+    ) -> tuple[list[float], EmbeddingSpaceMetadata]:
+        active_space = self.get_active_embedding_space(organization_id)
+        providers = self.model_providers.get(organization_id, [])
+        return self.llm_gateway.embed_with_space_contract(
+            query,
+            organization_id=organization_id,
+            providers_catalog=providers,
+            target_space=active_space,
+        )
+
     def search_memories(
         self,
         *,
@@ -1912,6 +2079,11 @@ class ApexPlatformService:
         top_k: int = 8,
     ) -> list[dict[str, Any]]:
         self.authorize(user_id=user_id, organization_id=organization_id)
+        active_space = self.get_active_embedding_space(organization_id)
+        q_vec, _ = self.embed_query_for_active_index(
+            organization_id=organization_id,
+            query=query,
+        )
         candidates: list[dict[str, Any]] = []
         for mid, mem in self.memories.items():
             if mem["organization_id"] != organization_id:
@@ -1922,6 +2094,9 @@ class ApexPlatformService:
                 continue
             if project_id and mem.get("project_id") != project_id:
                 continue
+            mem_space = mem.get("embedding_index_metadata")
+            if isinstance(mem_space, dict) and mem_space.get("embedding_model"):
+                assert_compatible_embedding_spaces(mem_space, active_space)
             for ch in self.memory_chunks.get(mid, []):
                 candidates.append(
                     {
@@ -1930,7 +2105,101 @@ class ApexPlatformService:
                         "memory_title": mem["title"],
                     }
                 )
-        return rank_memory_chunks(query, candidates, top_k=top_k)
+        return rank_memory_chunks(
+            query,
+            candidates,
+            top_k=top_k,
+            query_vector=q_vec,
+            query_space=active_space,
+        )
+
+    def reindex_organization_memories(
+        self,
+        *,
+        user_id: str,
+        organization_id: str,
+        target_space: EmbeddingSpaceMetadata | dict[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically & non-destructively reindex all active tenant memories into `target_space`.
+
+        Stages every chunk vector first: if ANY document or provider call fails, zero existing
+        vectors, metadata, or memories are modified or deleted.
+        """
+        self.authorize(
+            user_id=user_id,
+            organization_id=organization_id,
+            required_permission="memory:write",
+        )
+        resolved_target = (
+            target_space
+            if isinstance(target_space, EmbeddingSpaceMetadata)
+            else EmbeddingSpaceMetadata.from_dict(target_space)
+        )
+        previous_space = self.get_active_embedding_space(organization_id)
+
+        org_memories = [
+            mem
+            for mem in self.memories.values()
+            if mem["organization_id"] == organization_id
+            and mem["retention_state"] == "active"
+        ]
+
+        # Phase 1: Build complete staged index WITHOUT touching live state
+        staged_chunks: dict[str, list[dict[str, Any]]] = {}
+        total_chunks = 0
+        for mem in org_memories:
+            built = self._build_memory_chunks_for_space(mem, target_space=resolved_target)
+            staged_chunks[mem["id"]] = built
+            total_chunks += len(built)
+
+        # Phase 2: Atomic swap preserving non-destructive generation metadata
+        now = utcnow().isoformat()
+        for mem in org_memories:
+            mid = mem["id"]
+            old_chunks = self.memory_chunks.get(mid, [])
+            prev_gens = list(mem.get("previous_index_generations") or [])
+            prev_gens.append(
+                {
+                    "version": mem.get("version", 1),
+                    "chunk_count": len(old_chunks),
+                    "embedding_index_metadata": mem.get("embedding_index_metadata")
+                    or previous_space.to_dict(),
+                    "archived_at": now,
+                }
+            )
+            mem["previous_index_generations"] = prev_gens[-5:]
+            mem["version"] = int(mem.get("version", 1)) + 1
+            mem["embedding_index_metadata"] = resolved_target.to_dict()
+            mem["updated_at"] = now
+            self.memory_chunks[mid] = staged_chunks[mid]
+
+        self.memory_index_configs[organization_id] = resolved_target.to_dict()
+        rec = {
+            "id": str(uuid.uuid4()),
+            "organization_id": organization_id,
+            "previous_space": previous_space.to_dict(),
+            "active_space": resolved_target.to_dict(),
+            "memories_reindexed": len(org_memories),
+            "chunks_reindexed": total_chunks,
+            "completed_at": now,
+        }
+        self.memory_reindex_history.setdefault(organization_id, []).append(rec)
+        self.audit.append(
+            organization_id=organization_id,
+            actor_id=user_id,
+            actor_type="user",
+            action="memory.index.reindexed",
+            resource_type="memory_index",
+            resource_id=rec["id"],
+            risk_level="R1",
+            details={
+                "from_space": previous_space.space_id,
+                "to_space": resolved_target.space_id,
+                "memories_reindexed": len(org_memories),
+                "chunks_reindexed": total_chunks,
+            },
+        )
+        return rec
 
     def list_memories(
         self, *, user_id: str, organization_id: str, memory_type: str | None = None
@@ -1954,28 +2223,39 @@ class ApexPlatformService:
         organization_id: str,
         memory_id: str,
         action: str,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         self.authorize(
             user_id=user_id,
             organization_id=organization_id,
             required_permission="memory:write",
         )
-        mem = self._require_org_entity(self.memories, memory_id, organization_id, "Memory")
-        if action == "delete":
-            mem["retention_state"] = "deleted"
-            self.memory_chunks.pop(memory_id, None)
-            return {"id": memory_id, "status": "deleted"}
-        if action == "reindex":
-            mem["version"] = int(mem["version"]) + 1
-            mem["updated_at"] = utcnow().isoformat()
-            self._index_memory_chunks(mem)
-            return {
-                "id": memory_id,
-                "status": "reindexed",
-                "version": mem["version"],
-                "chunk_count": len(self.memory_chunks.get(memory_id, [])),
-            }
-        raise ValueError(f"Unsupported memory action '{action}'.")
+        with self._mutation_lock:
+            mem = self._require_org_entity(self.memories, memory_id, organization_id, "Memory")
+            cur_ver = int(mem.get("version", 1))
+            if expected_version is not None and int(expected_version) != cur_ver:
+                raise StaleWriteConflictError(
+                    "Memory",
+                    memory_id,
+                    expected_version=int(expected_version),
+                    actual_version=cur_ver,
+                )
+            if action == "delete":
+                mem["retention_state"] = "deleted"
+                mem["version"] = cur_ver + 1
+                self.memory_chunks.pop(memory_id, None)
+                return {"id": memory_id, "status": "deleted", "version": mem["version"]}
+            if action == "reindex":
+                mem["version"] = cur_ver + 1
+                mem["updated_at"] = utcnow().isoformat()
+                self._index_memory_chunks(mem)
+                return {
+                    "id": memory_id,
+                    "status": "reindexed",
+                    "version": mem["version"],
+                    "chunk_count": len(self.memory_chunks.get(memory_id, [])),
+                }
+            raise ValueError(f"Unsupported memory action '{action}'.")
 
     # =========================================================================
     # DATASETS, EXPERIMENTS, REPRODUCTION & EVALUATIONS
@@ -2081,6 +2361,8 @@ class ApexPlatformService:
         parameters: dict[str, Any] | None = None,
         research_project_id: str | None = None,
         workspace_scope: str = "research",
+        canonical_objective: str | None = None,
+        cases: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         self.authorize(
             user_id=user_id,
@@ -2100,6 +2382,21 @@ class ApexPlatformService:
         if ver_obj is None:
             raise ResourceNotFoundError("Dataset version not found.")
 
+        blind_sources = build_blind_benchmark_sources(
+            ver_obj.get("records_json", []),
+            organization_id=organization_id,
+            project_id=research_project_id,
+        )
+        symmetrical_objective = (
+            canonical_objective
+            or f"Controlled Experiment on Dataset {ds['name']} v{int(dataset_version)}"
+        )
+        symmetrical_budget = {
+            "max_llm_calls_per_run": 6,
+            "max_tokens_per_agent": 12000,
+            "max_cost_budget_usd": 0.50,
+        }
+
         eid = str(uuid.uuid4())
         now = utcnow().isoformat()
         exp = {
@@ -2109,7 +2406,11 @@ class ApexPlatformService:
             "name": name,
             "description": description,
             "dataset_id": ds["id"],
+            "dataset_category": ds.get("category", "synthetic"),
             "dataset_version": int(dataset_version),
+            "source_count": len(blind_sources),
+            "budget_limits": symmetrical_budget,
+            "canonical_objective": symmetrical_objective,
             "execution_mode": execution_mode,
             "agent_id": agent_id,
             "agent_version": self.agents[agent_id]["current_version"]
@@ -2134,17 +2435,22 @@ class ApexPlatformService:
         agent_run = self.launch_agent_run(
             user_id=user_id,
             organization_id=organization_id,
-            objective=f"Eksperyment: {name}",
+            objective=symmetrical_objective,
             execution_mode=execution_mode,
             research_project_id=research_project_id,
             agent_id=agent_id,
             team_id=team_id,
             workspace_scope=workspace_scope,
+            model_identifier=model_identifier,
+            override_sources=blind_sources,
+            benchmark_blind_mode=True,
         )
         exp_run = execute_controlled_experiment_protocol(
             experiment=exp,
             dataset_version_obj=ver_obj,
             agent_run_result=agent_run,
+            dataset=ds,
+            cases=cases,
         )
         self.experiment_runs[exp_run["id"]] = exp_run
         return {"experiment": exp, "run": exp_run, "agent_run_id": agent_run["id"]}
@@ -2163,26 +2469,39 @@ class ApexPlatformService:
         exp = self._require_org_entity(
             self.experiments, orig_run["experiment_id"], organization_id, "Experiment"
         )
+        ds = self.datasets.get(exp["dataset_id"])
         ver_obj = next(
             v
             for v in self.dataset_versions[exp["dataset_id"]]
             if int(v["version"]) == int(exp["dataset_version"])
         )
+        blind_sources = build_blind_benchmark_sources(
+            ver_obj.get("records_json", []),
+            organization_id=organization_id,
+            project_id=exp.get("research_project_id"),
+        )
+        symmetrical_objective = str(
+            exp.get("canonical_objective") or f"Reprodukcja: {exp['name']}"
+        )
         agent_run = self.launch_agent_run(
             user_id=user_id,
             organization_id=organization_id,
-            objective=f"Reprodukcja: {exp['name']}",
+            objective=symmetrical_objective,
             execution_mode=exp["execution_mode"],
             research_project_id=exp.get("research_project_id"),
             agent_id=exp.get("agent_id"),
             team_id=exp.get("team_id"),
             workspace_scope=exp["workspace_scope"],
+            model_identifier=exp.get("model_identifier", "apex-analytical-local-v1"),
+            override_sources=blind_sources,
+            benchmark_blind_mode=True,
         )
         repro_run = execute_controlled_experiment_protocol(
             experiment=exp,
             dataset_version_obj=ver_obj,
             agent_run_result=agent_run,
             reproduced_from_run_id=orig_run["id"],
+            dataset=ds,
         )
         # Verify deterministic metric parity
         orig_metrics = {
@@ -2242,6 +2561,10 @@ class ApexPlatformService:
             self.eval_suites, suite_id, organization_id, "EvaluationSuite"
         )
         cases = self.eval_cases.get(suite_id, [])
+        canonical_bench_objective = (
+            f"Controlled Symmetrical Benchmark Suite: {suite['name']} "
+            f"(dataset={suite['dataset_id']}@v{suite['dataset_version']})"
+        )
         exp_bundle = self.create_and_run_experiment(
             user_id=user_id,
             organization_id=organization_id,
@@ -2254,13 +2577,27 @@ class ApexPlatformService:
             team_id=team_id,
             model_identifier=model_identifier,
             workspace_scope=workspace_scope,
+            canonical_objective=canonical_bench_objective,
+            cases=cases,
         )
         agent_run = self.agent_runs[exp_bundle["agent_run_id"]]
         exp_run = exp_bundle["run"]
 
         base_scores = None
         if baseline_eval_run_id and baseline_eval_run_id in self.eval_runs:
-            base_scores = self.eval_runs[baseline_eval_run_id]["summary_scores"]
+            base_eval = self._require_org_entity(
+                self.eval_runs, baseline_eval_run_id, organization_id, "EvaluationRun"
+            )
+            base_exp_run = self.experiment_runs.get(base_eval["experiment_run_id"])
+            if base_exp_run is not None:
+                assert_benchmark_symmetry(
+                    base_exp_run["spec_snapshot_json"],
+                    exp_run["spec_snapshot_json"],
+                    allow_cross_model=(
+                        base_eval.get("model_identifier") != model_identifier
+                    ),
+                )
+            base_scores = base_eval["summary_scores"]
 
         summary_scores, score_rows, regs = score_evaluation_run(
             suite=suite,
@@ -2269,6 +2606,7 @@ class ApexPlatformService:
             experiment_run_result=exp_run,
             baseline_summary_scores=base_scores,
         )
+        indep = exp_run.get("independent_evaluation") or {}
         eval_id = str(uuid.uuid4())
         now = utcnow().isoformat()
         eval_rec = {
@@ -2286,6 +2624,12 @@ class ApexPlatformService:
             "tokens_used": agent_run["tokens_used"],
             "cost_usd": agent_run["cost_usd"],
             "duration_ms": exp_run["duration_ms"],
+            "data_origin": indep.get("data_origin", "UNKNOWN"),
+            "evaluator_version": indep.get("evaluator_version"),
+            "blind_input_enforced": indep.get("blind_input_enforced", True),
+            "provenance": indep.get("provenance", {}),
+            "token_reconciliation": indep.get("token_reconciliation", {}),
+            "task_dimensions": indep.get("task_dimensions", {}),
             "summary_scores": summary_scores,
             "status": "COMPLETED",
             "workspace_scope": workspace_scope,
@@ -2305,6 +2649,54 @@ class ApexPlatformService:
                 }
             )
         return {**eval_rec, "scores": score_rows, "regressions": regs}
+
+    def compare_symmetrical_benchmark_runs(
+        self,
+        *,
+        user_id: str,
+        organization_id: str,
+        baseline_eval_run_id: str,
+        candidate_eval_run_id: str,
+    ) -> dict[str, Any]:
+        """Validate symmetry and return side-by-side 7-dimension benchmark comparison."""
+        self.authorize(user_id=user_id, organization_id=organization_id)
+        base_eval = self._require_org_entity(
+            self.eval_runs, baseline_eval_run_id, organization_id, "EvaluationRun"
+        )
+        cand_eval = self._require_org_entity(
+            self.eval_runs, candidate_eval_run_id, organization_id, "EvaluationRun"
+        )
+        base_exp = self._require_org_entity(
+            self.experiment_runs, base_eval["experiment_run_id"], organization_id, "ExperimentRun"
+        )
+        cand_exp = self._require_org_entity(
+            self.experiment_runs, cand_eval["experiment_run_id"], organization_id, "ExperimentRun"
+        )
+        assert_benchmark_symmetry(
+            base_exp["spec_snapshot_json"],
+            cand_exp["spec_snapshot_json"],
+            allow_cross_model=(
+                base_eval.get("model_identifier") != cand_eval.get("model_identifier")
+            ),
+        )
+        dim_deltas: dict[str, Any] = {}
+        b_dims = base_eval.get("task_dimensions") or {}
+        c_dims = cand_eval.get("task_dimensions") or {}
+        for dim_name in b_dims:
+            bf1 = (b_dims.get(dim_name) or {}).get("f1")
+            cf1 = (c_dims.get(dim_name) or {}).get("f1")
+            if isinstance(bf1, (int, float)) and isinstance(cf1, (int, float)):
+                dim_deltas[dim_name] = round(float(cf1) - float(bf1), 4)
+            else:
+                dim_deltas[dim_name] = "NOT_AVAILABLE"
+        return {
+            "symmetry_verified": True,
+            "data_origin": cand_eval.get("data_origin", "UNKNOWN"),
+            "evaluator_version": cand_eval.get("evaluator_version"),
+            "baseline": base_eval,
+            "candidate": cand_eval,
+            "f1_deltas": dim_deltas,
+        }
 
     def submit_human_evaluation_score(
         self,
@@ -2377,6 +2769,15 @@ class ApexPlatformService:
 
     def _ensure_lmstudio_lan_provider(self, organization_id: str) -> list[dict[str, Any]]:
         providers = self.model_providers.setdefault(organization_id, [])
+        # Seed owner-trusted local origins strictly scoped to this organization_id
+        self.llm_gateway.trust_local_origin(
+            organization_id=organization_id,
+            url_or_origin="http://192.168.18.184:1234/v1",
+        )
+        self.llm_gateway.trust_local_origin(
+            organization_id=organization_id,
+            url_or_origin="http://127.0.0.1:11434",
+        )
         if not any(p.get("slug") == "lmstudio-lan-qwen" for p in providers):
             providers.insert(
                 1 if providers else 0,
@@ -2441,8 +2842,9 @@ class ApexPlatformService:
         provider_slug: str,
         api_key: str,
         base_url: str | None = None,
+        allow_dev_loopback: bool = False,
     ) -> dict[str, Any]:
-        self.authorize(
+        auth = self.authorize(
             user_id=user_id,
             organization_id=organization_id,
             required_permission="models:manage",
@@ -2462,8 +2864,30 @@ class ApexPlatformService:
         if target is None:
             raise ResourceNotFoundError(f"Model provider '{provider_slug}' not found.")
         canonical_slug = str(target["slug"])
+        trust_class = classify_provider_trust_class(target)
         if base_url:
-            target["base_url"] = base_url.strip()
+            cleaned_url = base_url.strip().rstrip("/")
+            if trust_class == EndpointTrustClass.CONTROLLED_LOCAL_MODEL:
+                if auth.get("role") != "Owner":
+                    raise AuthorizationError(
+                        "Only an Organization Owner may register or modify controlled local model endpoints."
+                    )
+                self.llm_gateway.trust_local_origin(
+                    organization_id=organization_id,
+                    url_or_origin=cleaned_url,
+                )
+            else:
+                resolve_and_validate_url(
+                    cleaned_url,
+                    trust_class=EndpointTrustClass.PUBLIC_PROVIDER,
+                    allow_dev_loopback=allow_dev_loopback,
+                    dns_resolver=self.llm_gateway._dns_resolver,
+                )
+            target["base_url"] = cleaned_url
+            if allow_dev_loopback:
+                target["allow_dev_loopback"] = True
+            else:
+                target.pop("allow_dev_loopback", None)
         meta = self.llm_gateway.set_runtime_secret(
             organization_id=organization_id,
             provider_slug=canonical_slug,
@@ -2477,7 +2901,11 @@ class ApexPlatformService:
             resource_type="model_provider",
             resource_id=target["id"],
             risk_level="R2",
-            details={"provider_slug": canonical_slug, "configured": meta["configured"]},
+            details={
+                "provider_slug": canonical_slug,
+                "configured": meta["configured"],
+                "trust_class": trust_class.value,
+            },
         )
         return {
             "provider_slug": canonical_slug,
@@ -3000,12 +3428,26 @@ class ApexPlatformService:
         org_budget = self.budgets.get(organization_id, [{"max_cost_usd": 100.0}])[0]
         max_budget = float(org_budget.get("max_cost_usd", 100.0))
 
+        org_call_records = [
+            rec
+            for rec in self.call_attribution_records
+            if rec.get("organization_id") == organization_id
+            and (scope in {None, "all"} or rec.get("workspace_scope") == scope)
+            and (not since_iso or str(rec.get("invocation_timestamp") or "") >= since_iso)
+        ]
+        cost_attr = aggregate_workflow_cost_attribution(org_call_records)
+
         return {
             "agent_execution_count": total_runs,
             "successful_executions": succeeded,
             "failure_rate_pct": round(100.0 * failed / max(1, total_runs), 2),
             "avg_execution_time_ms": avg_ms,
             "total_model_cost_usd": total_cost,
+            "actual_cost_usd_total": cost_attr["actual_cost_usd_total"],
+            "estimated_cost_usd_total": cost_attr["estimated_cost_usd_total"],
+            "has_unknown_pricing": cost_attr["has_unknown_pricing"],
+            "unknown_cost_calls_count": cost_attr["unknown_cost_calls_count"],
+            "cost_attribution": cost_attr,
             "total_tokens_consumed": total_tokens,
             "tool_invocation_count": total_tools,
             "workflow_total": len(wf_runs),
@@ -3034,6 +3476,62 @@ class ApexPlatformService:
                 for ev in evals
             ],
             "usage_series": usages[-30:],
+        }
+
+    def record_call_attribution(
+        self,
+        *,
+        organization_id: str,
+        record: CallCostAttributionRecord | dict[str, Any],
+    ) -> dict[str, Any]:
+        """Append an explicit per-call cost attribution record (deduplicated by `execution_id`)."""
+        rec_dict = (
+            record.to_dict()
+            if isinstance(record, CallCostAttributionRecord)
+            else dict(record)
+        )
+        rec_dict["organization_id"] = organization_id
+        rec_dict.setdefault("workspace_scope", "research")
+        existing_ids = {
+            str(r.get("execution_id"))
+            for r in self.call_attribution_records
+            if r.get("execution_id")
+        }
+        if rec_dict.get("execution_id") not in existing_ids:
+            self.call_attribution_records.append(rec_dict)
+        return rec_dict
+
+    def get_cost_attribution_ledger(
+        self,
+        *,
+        user_id: str,
+        organization_id: str,
+        workflow_run_id: str | None = None,
+        scope: str | None = None,
+    ) -> dict[str, Any]:
+        """Return granular per-call attribution records and rolled-up category/provider/agent totals."""
+        self.authorize(user_id=user_id, organization_id=organization_id)
+        rows = [
+            rec
+            for rec in self.call_attribution_records
+            if rec.get("organization_id") == organization_id
+            and (
+                workflow_run_id is None
+                or rec.get("workflow_run_id") == workflow_run_id
+            )
+            and (scope in {None, "all"} or rec.get("workspace_scope") == scope)
+        ]
+        summary = aggregate_workflow_cost_attribution(
+            rows, workflow_run_id=workflow_run_id
+        )
+        return {
+            "summary": summary,
+            "calls": rows,
+            "pricing_note": (
+                "Contains unpriced calls (`cost_status=unknown`); known totals exclude unknown tariffs."
+                if summary["has_unknown_pricing"]
+                else "All recorded calls have verified actual, known-tariff, or $0.00 local pricing."
+            ),
         }
 
     def export_analytics_csv(
@@ -3170,19 +3668,25 @@ class ApexPlatformService:
             "evaluation_profile": raw.get("evaluation_profile", "research_rigor_v1"),
         }
 
-    def _index_memory_chunks(self, mem: dict[str, Any]) -> None:
+    def _build_memory_chunks_for_space(
+        self,
+        mem: dict[str, Any],
+        *,
+        target_space: EmbeddingSpaceMetadata,
+    ) -> list[dict[str, Any]]:
         raw_chunks = chunk_document_text(mem["content"])
         org_id = mem["organization_id"]
         providers = self.model_providers.get(org_id, [])
+        space_dict = target_space.to_dict()
         built: list[dict[str, Any]] = []
-        allow_ext_emb = os.environ.get("APEX_ENABLE_EXTERNAL_EMBEDDINGS", "").lower() == "true"
         for idx, ch_text in enumerate(raw_chunks):
-            vec, backend_name = self.llm_gateway.embed_text_1536_with_live_provider(
+            vec, used_space = self.llm_gateway.embed_with_space_contract(
                 ch_text,
                 organization_id=org_id,
                 providers_catalog=providers,
-                allow_external_cloud=allow_ext_emb,
+                target_space=target_space,
             )
+            assert_compatible_embedding_spaces(used_space, target_space)
             built.append(
                 {
                     "id": str(uuid.uuid4()),
@@ -3192,12 +3696,26 @@ class ApexPlatformService:
                     "content": ch_text,
                     "embedding": vec,
                     "source_citation": f"{mem['source_ref']}#chunk-{idx + 1}",
+                    "embedding_index_metadata": space_dict,
                     "metadata": {
                         **(mem.get("metadata") or {}),
-                        "embedding_backend": backend_name,
+                        "embedding_backend": f"{used_space.embedding_provider}:{used_space.embedding_model}",
+                        "embedding_index_metadata": space_dict,
                     },
                 }
             )
+        return built
+
+    def _index_memory_chunks(
+        self,
+        mem: dict[str, Any],
+        *,
+        target_space: EmbeddingSpaceMetadata | None = None,
+    ) -> None:
+        org_id = mem["organization_id"]
+        active_space = target_space or self.get_active_embedding_space(org_id)
+        built = self._build_memory_chunks_for_space(mem, target_space=active_space)
+        mem["embedding_index_metadata"] = active_space.to_dict()
         self.memory_chunks[mem["id"]] = built
 
     def _persist_run_side_effects(
@@ -3205,32 +3723,121 @@ class ApexPlatformService:
     ) -> None:
         org_id = run_data["organization_id"]
         if run_data["status"] == "COMPLETED":
-            step_tels = [
-                (s.get("output_json") or {}).get("telemetry") or {}
-                for s in (run_data.get("steps") or [])
-            ]
-            exact_prompt_tok = sum(int(t.get("input_tokens") or 0) for t in step_tels)
-            exact_comp_tok = sum(int(t.get("output_tokens") or 0) for t in step_tels)
-            llm_tels = [t for t in step_tels if t.get("llm_invoked")]
-            used_prov = str(llm_tels[-1].get("provider")) if llm_tels else "local_python"
-            used_mod = str(llm_tels[-1].get("model")) if llm_tels else "none"
-            self.usage_records.append(
-                {
-                    "id": str(uuid.uuid4()),
-                    "organization_id": org_id,
-                    "agent_run_id": run_data["id"],
-                    "model_identifier": used_mod,
-                    "provider_name": used_prov,
-                    "prompt_tokens": exact_prompt_tok,
-                    "completion_tokens": exact_comp_tok,
-                    "total_tokens": exact_prompt_tok + exact_comp_tok,
-                    "cost_usd": float(run_data["cost_usd"]),
-                    "latency_ms": int(run_data["duration_ms"]),
-                    "tool_calls_count": len(run_data.get("tool_invocations", [])),
-                    "workspace_scope": run_data["workspace_scope"],
-                    "recorded_at": utcnow().isoformat(),
-                }
+            call_recs: list[dict[str, Any]] = list(
+                run_data.get("call_attribution_records") or []
             )
+            if not call_recs:
+                for s in run_data.get("steps") or []:
+                    t = (s.get("output_json") or {}).get("telemetry") or {}
+                    if t:
+                        call_recs.append(
+                            build_call_attribution_record(
+                                workflow_run_id=str(run_data["id"]),
+                                step_id=str(t.get("step_id") or s.get("id") or ""),
+                                agent_id=str(
+                                    t.get("agent_id")
+                                    or s.get("agent_slug")
+                                    or "system"
+                                ),
+                                provider=str(t.get("provider") or "local_python"),
+                                model=str(t.get("model") or "none"),
+                                execution_mode=str(
+                                    t.get("execution_mode") or "LOCAL_DETERMINISTIC"
+                                ),
+                                input_tokens=int(t.get("input_tokens") or 0),
+                                output_tokens=int(t.get("output_tokens") or 0),
+                                cached_tokens=int(t.get("cached_tokens") or 0),
+                                latency_ms=float(t.get("latency_ms") or 0.0),
+                                cache_hit=bool(t.get("cache_hit")),
+                                llm_invoked=bool(t.get("llm_invoked")),
+                                external_api_invoked=bool(
+                                    t.get("external_api_invoked")
+                                ),
+                                organization_id=org_id,
+                                workspace_scope=run_data["workspace_scope"],
+                            ).to_dict()
+                        )
+
+            for rec in call_recs:
+                self.record_call_attribution(
+                    organization_id=org_id,
+                    record={
+                        **rec,
+                        "workflow_run_id": str(run_data["id"]),
+                        "organization_id": org_id,
+                        "workspace_scope": run_data["workspace_scope"],
+                    },
+                )
+
+            # Group usage records accurately per (provider, model) instead of overwriting with `llm_tels[-1]`!
+            grouped_usage: dict[tuple[str, str], dict[str, Any]] = {}
+            for rec in call_recs:
+                prov = str(rec.get("provider") or "local_python")
+                mod = str(rec.get("model") or "none")
+                key = (prov, mod)
+                bucket = grouped_usage.setdefault(
+                    key,
+                    {
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "cached_tokens": 0,
+                        "cost_usd": 0.0,
+                        "latency_ms": 0.0,
+                        "cost_status": rec.get("cost_status", "local_zero_api_cost"),
+                        "pricing_version": rec.get("pricing_version", "unknown"),
+                    },
+                )
+                if not rec.get("cache_hit"):
+                    bucket["prompt_tokens"] += int(rec.get("input_tokens") or 0)
+                    bucket["completion_tokens"] += int(rec.get("output_tokens") or 0)
+                    bucket["cached_tokens"] += int(rec.get("cached_tokens") or 0)
+                    act_v = rec.get("actual_cost_usd")
+                    est_v = rec.get("estimated_cost_usd")
+                    bucket["cost_usd"] += float(
+                        act_v if act_v is not None else (est_v or 0.0)
+                    )
+                bucket["latency_ms"] += float(rec.get("latency_ms") or 0.0)
+                if rec.get("cost_status") == "unknown":
+                    bucket["cost_status"] = "unknown"
+
+            if not grouped_usage:
+                grouped_usage[("local_python", "none")] = {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "cached_tokens": 0,
+                    "cost_usd": float(run_data.get("cost_usd") or 0.0),
+                    "latency_ms": float(run_data.get("duration_ms") or 0),
+                    "cost_status": "local_zero_api_cost",
+                    "pricing_version": "apex-pricing-2026-11-v1",
+                }
+
+            first_bucket = True
+            for (used_prov, used_mod), b in grouped_usage.items():
+                self.usage_records.append(
+                    {
+                        "id": str(uuid.uuid4()),
+                        "organization_id": org_id,
+                        "agent_run_id": run_data["id"],
+                        "model_identifier": used_mod,
+                        "provider_name": used_prov,
+                        "prompt_tokens": int(b["prompt_tokens"]),
+                        "completion_tokens": int(b["completion_tokens"]),
+                        "cached_tokens": int(b["cached_tokens"]),
+                        "total_tokens": int(b["prompt_tokens"] + b["completion_tokens"]),
+                        "cost_usd": round(float(b["cost_usd"]), 8),
+                        "cost_status": b["cost_status"],
+                        "pricing_version": b["pricing_version"],
+                        "latency_ms": max(1, int(round(b["latency_ms"]))),
+                        "tool_calls_count": (
+                            len(run_data.get("tool_invocations", []))
+                            if first_bucket
+                            else 0
+                        ),
+                        "workspace_scope": run_data["workspace_scope"],
+                        "recorded_at": utcnow().isoformat(),
+                    }
+                )
+                first_bucket = False
             proj_id = run_data.get("research_project_id")
             out = run_data.get("output_json") or {}
             if proj_id and proj_id in self.projects:
@@ -3443,16 +4050,22 @@ class ApexPlatformService:
             )
 
     def _bootstrap_workspace_and_demo(self) -> None:
-        """Seed roles, accounts, datasets, and Part IX comparative demonstration."""
+        """Seed roles, accounts, datasets, and Part IX comparative demonstration (dev/test ONLY)."""
+        if self._env_profile not in {"development", "test"}:
+            raise ValueError(
+                f"Demo seeding is strictly forbidden in '{self._env_profile}' environment."
+            )
+        demo_pw = os.environ.get("APEX_DEV_DEMO_PASSWORD") or "ApexResearch!2026"
         owner = self.register_user(
             email="admin@apex-one.local",
-            password="ApexResearch!2026",
+            password=demo_pw,
             display_name="Dr Anna Kowalska (Owner)",
             organization_name="APEX ONE Research Laboratory",
             locale="pl",
         )
         org_id = self.list_user_organizations(owner["id"])[0]["organization_id"]
         self.default_org_id = org_id
+        self.demo_seeded = True
 
         # Add Researcher, Evaluator, and Viewer accounts in the same lab organization
         for email, name, role in [
@@ -3460,7 +4073,7 @@ class ApexPlatformService:
             ("evaluator@apex-one.local", "Dr Ewa Wiśniewska (Evaluator)", "Evaluator"),
             ("viewer@apex-one.local", "Tomasz Zieliński (Viewer)", "Viewer"),
         ]:
-            u = self.register_user(email=email, password="ApexResearch!2026", display_name=name)
+            u = self.register_user(email=email, password=demo_pw, display_name=name)
             self.memberships.append(
                 {
                     "id": str(uuid.uuid4()),

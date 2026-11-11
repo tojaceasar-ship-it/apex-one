@@ -1139,6 +1139,9 @@ class PlatformIdentityDirectoryRecord(Base, TimestampMixin):
     __tablename__ = "platform_identity_directory"
 
     singleton_key: Mapped[str] = mapped_column(String(48), primary_key=True)
+    version_num: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
     identity_json: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, default=dict
     )
@@ -1153,7 +1156,39 @@ class OrganizationWorkspaceStateRecord(Base, TimestampMixin):
         primary_key=True,
         nullable=False,
     )
+    version_num: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
     state_json: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, default=dict
+    )
+
+
+class IdempotencyRecord(Base, OrgScopedMixin):
+    __tablename__ = "idempotency_records"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status_code: Mapped[int] = mapped_column(Integer, nullable=False, default=200)
+    response_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, server_default=func.now(), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "idempotency_key",
+            name="uq_idempotency_records_org_key",
+        ),
+        Index("ix_idempotency_records_expires_at", "expires_at"),
     )
 

@@ -20,8 +20,15 @@ from fastapi import (
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from apex_one.platform.concurrency import (
+    IdempotencyConflictError,
+    StaleWriteConflictError,
+    parse_expected_version_header,
+)
+from apex_one.platform.experiments_and_eval import BenchmarkIntegrityError
 from apex_one.platform.governance import GovernanceBlockedError, ImmutableAuditError
 from apex_one.platform.lan_llm_bridge import build_lan_bridge_python_script
+from apex_one.platform.memory_and_docs import EmbeddingSpaceMismatchError
 from apex_one.platform.research_engine import InvalidResearchStateTransitionError
 from apex_one.platform.scientific_connectors import SSRFBlockedError
 from apex_one.platform.workspace_service import (
@@ -87,6 +94,7 @@ class CreateAgentBody(BaseModel):
 class UpdateAgentBody(BaseModel):
     updates: dict[str, Any]
     change_summary: str = "Updated AgentDNA configuration"
+    expected_version: int | None = Field(default=None, ge=1)
 
 
 class AgentStatusBody(BaseModel):
@@ -145,6 +153,7 @@ class CreateProjectBody(BaseModel):
 
 class TransitionStateBody(BaseModel):
     target_state: str
+    expected_version: int | None = Field(default=None, ge=1)
 
 
 class UpsertBriefBody(BaseModel):
@@ -190,6 +199,7 @@ class PatchClaimStatusBody(BaseModel):
         "unresolved",
         "rejected",
     ]
+    expected_version: int | None = Field(default=None, ge=1)
 
 
 class CreateMemoryBody(BaseModel):
@@ -203,6 +213,16 @@ class CreateMemoryBody(BaseModel):
 
 class MemoryActionBody(BaseModel):
     action: Literal["reindex", "delete"]
+    expected_version: int | None = Field(default=None, ge=1)
+
+
+class ReindexMemoriesSpaceBody(BaseModel):
+    embedding_model: str = Field(min_length=2)
+    embedding_provider: str = Field(min_length=2)
+    embedding_version: str = Field(default="v1", min_length=1)
+    embedding_dimensions: int = Field(default=1536, ge=64, le=4096)
+    normalization_method: str = "l2_unit_norm"
+    distance_metric: str = "cosine"
 
 
 class CreateDatasetBody(BaseModel):
@@ -397,10 +417,47 @@ def create_platform_router(get_platform: Any) -> APIRouter:
                 status_code=400,
                 detail={"code": "SSRF_BLOCKED", "message": str(exc)},
             ) from exc
+        except EmbeddingSpaceMismatchError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "EMBEDDING_SPACE_MISMATCH", "message": str(exc)},
+            ) from exc
+        except BenchmarkIntegrityError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "BENCHMARK_INTEGRITY_ERROR", "message": str(exc)},
+            ) from exc
+        except StaleWriteConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "STALE_WRITE_CONFLICT",
+                    "message": str(exc),
+                    "resource_type": exc.resource_type,
+                    "resource_id": exc.resource_id,
+                    "expected_version": exc.expected_version,
+                    "actual_version": exc.actual_version,
+                },
+            ) from exc
+        except IdempotencyConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "IDEMPOTENCY_KEY_CONFLICT", "message": str(exc)},
+            ) from exc
         except ValueError as exc:
             raise HTTPException(
                 status_code=400, detail={"code": "VALIDATION_ERROR", "message": str(exc)}
             ) from exc
+
+    def _resolve_expected_version(
+        request: Request, body_version: int | None
+    ) -> int | None:
+        hdr = request.headers.get("If-Match") or request.headers.get(
+            "X-Expected-Version"
+        )
+        if hdr is not None:
+            return parse_expected_version_header(hdr)
+        return body_version
 
     @router.post("/auth/register", status_code=201)
     async def register(body: RegisterBody) -> dict[str, Any]:
@@ -587,6 +644,7 @@ def create_platform_router(get_platform: Any) -> APIRouter:
     async def update_agent(
         agent_id: str,
         body: UpdateAgentBody,
+        request: Request,
         ctx: dict[str, Any] = Depends(require_auth_context),
     ) -> dict[str, Any]:
         return handle_domain_call(
@@ -596,6 +654,9 @@ def create_platform_router(get_platform: Any) -> APIRouter:
                 agent_id=agent_id,
                 updates=body.updates,
                 change_summary=body.change_summary,
+                expected_version=_resolve_expected_version(
+                    request, body.expected_version
+                ),
             )
         )
 
@@ -852,6 +913,7 @@ def create_platform_router(get_platform: Any) -> APIRouter:
     async def transition_project(
         project_id: str,
         body: TransitionStateBody,
+        request: Request,
         ctx: dict[str, Any] = Depends(require_auth_context),
     ) -> dict[str, Any]:
         return handle_domain_call(
@@ -860,6 +922,9 @@ def create_platform_router(get_platform: Any) -> APIRouter:
                 organization_id=ctx["organization_id"],
                 project_id=project_id,
                 target_state=body.target_state,
+                expected_version=_resolve_expected_version(
+                    request, body.expected_version
+                ),
             )
         )
 
@@ -986,6 +1051,7 @@ def create_platform_router(get_platform: Any) -> APIRouter:
     async def patch_claim_status(
         claim_id: str,
         body: PatchClaimStatusBody,
+        request: Request,
         ctx: dict[str, Any] = Depends(require_auth_context),
     ) -> dict[str, Any]:
         return handle_domain_call(
@@ -994,6 +1060,9 @@ def create_platform_router(get_platform: Any) -> APIRouter:
                 organization_id=ctx["organization_id"],
                 claim_id=claim_id,
                 status=body.status,
+                expected_version=_resolve_expected_version(
+                    request, body.expected_version
+                ),
             )
         )
 
@@ -1056,11 +1125,12 @@ def create_platform_router(get_platform: Any) -> APIRouter:
         org_id: str = ctx["organization_id"]
         container = request.app.state.container
         if container.platform_persistence.active:
-            q_vec, backend_name = await asyncio.to_thread(
-                lambda: svc.llm_gateway.embed_text_1536_with_live_provider(
-                    q,
-                    organization_id=org_id,
-                    providers_catalog=svc.model_providers.get(org_id, []),
+            q_vec, used_space = await asyncio.to_thread(
+                lambda: handle_domain_call(
+                    lambda: svc.embed_query_for_active_index(
+                        organization_id=org_id,
+                        query=q,
+                    )
                 )
             )
             pg_hits = await container.platform_persistence.pgvector_hybrid_search(
@@ -1073,10 +1143,12 @@ def create_platform_router(get_platform: Any) -> APIRouter:
             )
             return {
                 "query": q,
-                "search_engine": f"postgresql_pgvector+{backend_name}",
+                "search_engine": f"postgresql_pgvector+{used_space.space_id}",
+                "embedding_index_metadata": used_space.to_dict(),
                 "results": pg_hits,
             }
 
+        active_space = svc.get_active_embedding_space(org_id)
         hits = handle_domain_call(
             lambda: svc.search_memories(
                 user_id=ctx["user_id"],
@@ -1087,12 +1159,44 @@ def create_platform_router(get_platform: Any) -> APIRouter:
                 top_k=top_k,
             )
         )
-        return {"query": q, "search_engine": "in_process_hybrid", "results": hits}
+        return {
+            "query": q,
+            "search_engine": "in_process_hybrid",
+            "embedding_index_metadata": active_space.to_dict(),
+            "results": hits,
+        }
+
+    @router.get("/memories/index-metadata")
+    async def get_memory_index_metadata(
+        ctx: dict[str, Any] = Depends(require_auth_context),
+    ) -> dict[str, Any]:
+        svc: ApexPlatformService = ctx["svc"]
+        org_id: str = ctx["organization_id"]
+        return {
+            "active_space": svc.get_active_embedding_space(org_id).to_dict(),
+            "reindex_history": svc.memory_reindex_history.get(org_id, []),
+        }
+
+    @router.post("/memories/reindex")
+    async def reindex_memories_into_space(
+        body: ReindexMemoriesSpaceBody,
+        ctx: dict[str, Any] = Depends(require_auth_context),
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            lambda: handle_domain_call(
+                lambda: ctx["svc"].reindex_organization_memories(
+                    user_id=ctx["user_id"],
+                    organization_id=ctx["organization_id"],
+                    target_space=body.model_dump(),
+                )
+            )
+        )
 
     @router.post("/memories/{memory_id}/action")
     async def memory_action(
         memory_id: str,
         body: MemoryActionBody,
+        request: Request,
         ctx: dict[str, Any] = Depends(require_auth_context),
     ) -> dict[str, Any]:
         return handle_domain_call(
@@ -1101,6 +1205,9 @@ def create_platform_router(get_platform: Any) -> APIRouter:
                 organization_id=ctx["organization_id"],
                 memory_id=memory_id,
                 action=body.action,
+                expected_version=_resolve_expected_version(
+                    request, body.expected_version
+                ),
             )
         )
 
@@ -1485,6 +1592,21 @@ def create_platform_router(get_platform: Any) -> APIRouter:
                 organization_id=ctx["organization_id"],
                 scope=scope,
                 since_iso=since,
+            )
+        )
+
+    @router.get("/analytics/cost-attribution")
+    async def analytics_cost_attribution(
+        workflow_run_id: str | None = Query(default=None),
+        scope: str | None = Query(default=None),
+        ctx: dict[str, Any] = Depends(require_auth_context),
+    ) -> dict[str, Any]:
+        return handle_domain_call(
+            lambda: ctx["svc"].get_cost_attribution_ledger(
+                user_id=ctx["user_id"],
+                organization_id=ctx["organization_id"],
+                workflow_run_id=workflow_run_id,
+                scope=scope,
             )
         )
 
