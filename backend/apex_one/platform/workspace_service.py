@@ -2070,7 +2070,11 @@ class ApexPlatformService:
             if isinstance(mem_space, dict) and mem_space.get("embedding_model"):
                 assert_compatible_embedding_spaces(mem_space, active_space)
             for ch in self.memory_chunks.get(mid, []):
-                ch_space = (ch.get("metadata") or {}).get("embedding_space")
+                ch_space = (
+                    ch.get("embedding_index_metadata")
+                    or (ch.get("metadata") or {}).get("embedding_index_metadata")
+                    or (ch.get("metadata") or {}).get("embedding_space")
+                )
                 if isinstance(ch_space, dict) and ch_space.get("embedding_model"):
                     assert_compatible_embedding_spaces(ch_space, active_space)
         providers = self.model_providers.get(organization_id, [])

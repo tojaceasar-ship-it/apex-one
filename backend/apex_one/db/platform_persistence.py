@@ -455,6 +455,13 @@ class PostgresPlatformPersistence:
                                 "embedding": list(ch_row.embedding),
                                 "source_citation": ch_row.source_citation,
                                 "metadata": dict(ch_row.metadata_json or {}),
+                                "embedding_index_metadata": (
+                                    (ch_row.metadata_json or {}).get(
+                                        "embedding_index_metadata"
+                                    )
+                                    if isinstance(ch_row.metadata_json, dict)
+                                    else None
+                                ),
                                 "created_at": ch_row.created_at.isoformat(),
                             }
                         )
@@ -776,6 +783,11 @@ class PostgresPlatformPersistence:
                             emb = list(ch.get("embedding") or [])
                             if len(emb) != DEFAULT_EMBEDDING_DIM:
                                 continue
+                            ch_meta_json = dict(ch.get("metadata") or {})
+                            if ch.get("embedding_index_metadata"):
+                                ch_meta_json["embedding_index_metadata"] = ch[
+                                    "embedding_index_metadata"
+                                ]
                             org_session.add(
                                 MemoryChunkRecord(
                                     id=_as_uuid(ch["id"]),
@@ -785,7 +797,7 @@ class PostgresPlatformPersistence:
                                     content=ch["content"],
                                     embedding=emb,
                                     source_citation=ch["source_citation"],
-                                    metadata_json=dict(ch.get("metadata") or {}),
+                                    metadata_json=ch_meta_json,
                                 )
                             )
 
