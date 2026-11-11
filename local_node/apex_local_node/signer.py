@@ -54,12 +54,22 @@ def verify_envelope_signature(
     return hmac.compare_digest(expected, signature)
 
 
-def build_signed_headers(secret: str, payload: dict[str, Any]) -> dict[str, str]:
-    ts = int(time.time())
-    nonce = uuid.uuid4().hex
-    sig = sign_envelope(secret=secret, timestamp=ts, nonce=nonce, payload=payload)
-    return {
+def build_signed_headers(
+    secret: str,
+    payload: dict[str, Any],
+    *,
+    credential_id: str | None = None,
+    timestamp: int | None = None,
+    nonce: str | None = None,
+) -> dict[str, str]:
+    ts = int(time.time()) if timestamp is None else int(timestamp)
+    nc = uuid.uuid4().hex if nonce is None else nonce
+    sig = sign_envelope(secret=secret, timestamp=ts, nonce=nc, payload=payload)
+    headers = {
         "X-Apex-Node-Timestamp": str(ts),
-        "X-Apex-Node-Nonce": nonce,
+        "X-Apex-Node-Nonce": nc,
         "X-Apex-Node-Signature": sig,
     }
+    if credential_id:
+        headers["X-Apex-Node-Credential-Id"] = credential_id
+    return headers
