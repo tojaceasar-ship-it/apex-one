@@ -165,11 +165,17 @@ describe("APEX ONE Workbench End-to-End UI Flows", () => {
   it("renders Polish login by default, signs in, displays Command Center KPIs, and navigates to Approval Center", async () => {
     render(<App />);
 
-    // Default Polish UI on /login
+    // Default Polish UI on /login (fields start empty with no hardcoded demo credentials)
     expect(
       await screen.findByText("Zaloguj się do APEX ONE Workbench")
     ).toBeInTheDocument();
 
+    fireEvent.change(screen.getByLabelText("Email"), {
+      target: { value: "admin@apex-one.local" },
+    });
+    fireEvent.change(screen.getByLabelText("Password"), {
+      target: { value: "TestOnlyFixture!2026" },
+    });
     fireEvent.click(screen.getByRole("button", { name: /Zaloguj się/i }));
 
     // Redirects to Command Center and renders seeded Comparative Evaluation project & KPIs

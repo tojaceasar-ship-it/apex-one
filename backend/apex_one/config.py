@@ -14,7 +14,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-EnvironmentProfile = Literal["development", "staging", "production"]
+EnvironmentProfile = Literal["development", "test", "staging", "production"]
 PoolMode = Literal["pooled", "nullpool"]
 SandboxProviderType = Literal[
     "none", "external_http", "e2b", "modal", "rootless_container"
@@ -116,6 +116,9 @@ class Settings(BaseSettings):
     )
 
     env: EnvironmentProfile = Field(default="development", validation_alias="APEX_ENV")
+    enable_demo_seed: bool = Field(
+        default=False, validation_alias="APEX_ENABLE_DEMO_SEED"
+    )
     debug: bool = Field(default=False, validation_alias="APEX_DEBUG")
     log_level: str = Field(default="INFO", validation_alias="APEX_LOG_LEVEL")
     host: str = Field(default="0.0.0.0", validation_alias="APEX_HOST")
@@ -195,6 +198,18 @@ class Settings(BaseSettings):
     allowed_origins: str = Field(
         default="*", validation_alias="APEX_ALLOWED_ORIGINS"
     )
+    trusted_proxies: str = Field(
+        default="", validation_alias="APEX_TRUSTED_PROXIES"
+    )
+    rate_limit_rpm: int = Field(
+        default=600, ge=1, le=50000, validation_alias="APEX_RATE_LIMIT_RPM"
+    )
+    rate_limit_auth_rpm: int = Field(
+        default=30, ge=1, le=5000, validation_alias="APEX_RATE_LIMIT_AUTH_RPM"
+    )
+    rate_limit_expensive_rpm: int = Field(
+        default=60, ge=1, le=10000, validation_alias="APEX_RATE_LIMIT_EXPENSIVE_RPM"
+    )
 
     @property
     def effective_database_secret(self) -> SecretStr | None:
@@ -232,10 +247,15 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> list[str]:
         return [item.strip() for item in self.allowed_origins.split(",") if item.strip()]
 
+    @property
+    def trusted_proxy_list(self) -> list[str]:
+        return [item.strip() for item in self.trusted_proxies.split(",") if item.strip()]
+
     def redacted_summary(self) -> dict[str, object]:
         """Safe diagnostic snapshot that never exposes secret values."""
         return {
             "environment": self.env,
+            "demo_seed_enabled": self.enable_demo_seed,
             "database_configured": self.is_database_configured,
             "database_env_source": self.database_source_env_var,
             "database_dsn_redacted": redact_dsn(
@@ -258,6 +278,13 @@ class Settings(BaseSettings):
         if self.effective_database_secret is not None:
             validate_postgres_dsn(self.effective_database_secret.get_secret_value())
 
+        # Demo seeding is unconditionally forbidden outside explicit development/test
+        if self.enable_demo_seed and self.env not in {"development", "test"}:
+            raise ValueError(
+                f"Environment '{self.env}' strictly forbids demo seeding "
+                "(APEX_ENABLE_DEMO_SEED=true is permitted only in 'development' or 'test')."
+            )
+
         # Enforce strict production & staging invariants
         if self.env in {"staging", "production"}:
             raw_secret = self.secret_key.get_secret_value()
@@ -276,6 +303,13 @@ class Settings(BaseSettings):
             if "*" in self.cors_origins_list:
                 raise ValueError(
                     f"Environment '{self.env}' forbids wildcard '*' in APEX_ALLOWED_ORIGINS."
+                )
+            if self.local_node_shared_secret is not None:
+                from apex_one.local_node_gateway.protocol import validate_local_node_secret
+
+                validate_local_node_secret(
+                    self.local_node_shared_secret.get_secret_value(),
+                    env=self.env,
                 )
 
         if self.redis_required and not self.is_redis_configured:

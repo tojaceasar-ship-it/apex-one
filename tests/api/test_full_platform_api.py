@@ -12,7 +12,7 @@ pytestmark = pytest.mark.api
 
 
 async def test_seeded_comparative_demo_and_full_research_lifecycle() -> None:
-    app = create_app(Settings(env="development"))
+    app = create_app(Settings(env="development", enable_demo_seed=True), seed_demo=True)
     transport = httpx.ASGITransport(app=app)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
