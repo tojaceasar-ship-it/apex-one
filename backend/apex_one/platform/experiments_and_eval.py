@@ -222,7 +222,9 @@ def score_evaluation_run(
 
     # Efficiency scores reflect genuine operational cost/latency trade-offs:
     latency_score = round(max(0.25, min(1.0, 1.0 - (steps_count - 1.0) * 0.08)), 4)
-    cost_eff_score = round(max(0.25, min(1.0, 2000.0 / max(2000.0, tokens_used))), 4)
+    token_eff = 2000.0 / max(2000.0, tokens_used)
+    step_compute_overhead = min(0.25, max(0.0, (steps_count - 1.0) * 0.015))
+    cost_eff_score = round(max(0.25, min(1.0, token_eff - step_compute_overhead)), 4)
 
     summary_scores: dict[str, float] = {
         "functional_accuracy": functional_acc,

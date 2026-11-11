@@ -212,9 +212,15 @@ def test_llm_gateway_live_http_fallback_and_embeddings() -> None:
         )
         assert run["status"] == "COMPLETED"
         assert len(run["steps"]) == 8
-        assert all(
-            s["output_json"].get("live_llm_invoked") is True for s in run["steps"]
-        )
+        # Local-First architecture: deterministic/statistical agents do NOT waste LLM calls;
+        # semantic critique/writer steps invoke LLM with explicit justification.
+        by_agent = {s["agent_slug"]: s for s in run["steps"]}
+        assert by_agent["supervisor"]["output_json"]["live_llm_invoked"] is False
+        assert by_agent["source-scout"]["output_json"]["live_llm_invoked"] is False
+        assert by_agent["data-analyst"]["output_json"]["live_llm_invoked"] is False
+        assert by_agent["experiment-engineer"]["output_json"]["live_llm_invoked"] is False
+        assert by_agent["research-writer"]["output_json"]["live_llm_invoked"] is True
+        assert run["local_first_telemetry"]["local_operations_pct"] >= 75.0
         assert "Synteza Modelu (" in run["output_json"]["report_markdown"]
         assert "gpt-4.1-mini)" in run["output_json"]["report_markdown"]
     finally:

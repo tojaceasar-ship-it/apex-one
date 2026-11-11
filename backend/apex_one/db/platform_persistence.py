@@ -218,6 +218,12 @@ def export_org_bundle(svc: ApexPlatformService, org_id: str) -> dict[str, Any]:
         ],
         "model_providers": svc.model_providers.get(org_id, []),
         "extensions": svc.extensions.get(org_id, []),
+        "l3_data_cache_records": {
+            k: v
+            for k, v in svc.l3_data_cache_records.items()
+            if org_id in k or v.get("organization_id") == org_id
+        },
+        "execution_telemetry_log": list(svc.execution_telemetry_log[-200:]),
     }
 
 
@@ -263,6 +269,8 @@ def _reset_service_collections(svc: ApexPlatformService) -> None:
     svc.usage_records.clear()
     svc.model_providers.clear()
     svc.extensions.clear()
+    svc.l3_data_cache_records.clear()
+    svc.execution_telemetry_log.clear()
 
 
 class PostgresPlatformPersistence:
@@ -371,6 +379,13 @@ class PostgresPlatformPersistence:
                             b.get("model_providers") or []
                         )
                         svc.extensions[org_id] = list(b.get("extensions") or [])
+                        svc.l3_data_cache_records.update(
+                            b.get("l3_data_cache_records") or {}
+                        )
+                        if b.get("execution_telemetry_log") and not svc.execution_telemetry_log:
+                            svc.execution_telemetry_log.extend(
+                                b.get("execution_telemetry_log") or []
+                            )
 
                     # Hydrate pgvector memory chunks from `memory_chunks`
                     db_chunks = (

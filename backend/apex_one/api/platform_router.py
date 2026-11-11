@@ -1523,4 +1523,35 @@ def create_platform_router(get_platform: Any) -> APIRouter:
             )
         )
 
+    class LocalFirstExecuteBody(BaseModel):
+        operation: str = Field(min_length=2, max_length=64)
+        payload: dict[str, Any] = Field(default_factory=dict)
+
+    @router.get("/local-first/telemetry")
+    async def local_first_telemetry(
+        ctx: dict[str, Any] = Depends(require_auth_context),
+    ) -> dict[str, Any]:
+        return handle_domain_call(
+            lambda: ctx["svc"].get_local_first_telemetry(
+                user_id=ctx["user_id"],
+                organization_id=ctx["organization_id"],
+            )
+        )
+
+    @router.post("/local-first/execute")
+    async def local_first_execute(
+        body: LocalFirstExecuteBody,
+        ctx: dict[str, Any] = Depends(require_auth_context),
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            lambda: handle_domain_call(
+                lambda: ctx["svc"].execute_local_first_task(
+                    user_id=ctx["user_id"],
+                    organization_id=ctx["organization_id"],
+                    operation=body.operation,
+                    payload=body.payload,
+                )
+            )
+        )
+
     return router

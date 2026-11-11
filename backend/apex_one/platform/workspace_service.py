@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timedelta
@@ -38,6 +39,19 @@ from apex_one.platform.governance import (
     default_approval_expiry,
 )
 from apex_one.platform.llm_gateway import LLMGateway
+from apex_one.platform.local_intelligence import (
+    BUILTIN_AGENT_CONTRACTS,
+    ExecutionRouter,
+    MultiTierDataCache,
+    TaskCategory,
+    TelemetryLedger,
+    analyze_ohlcv_and_volatility,
+    analyze_tabular_csv_statistics,
+    compute_sha256_integrity,
+    fetch_btc_spot_and_ohlcv_http,
+    run_monte_carlo_simulation,
+    validate_and_parse_structured_data,
+)
 from apex_one.platform.memory_and_docs import (
     VALID_MEMORY_TYPES,
     chunk_document_text,
@@ -138,6 +152,18 @@ class ApexPlatformService:
         self.usage_records: list[dict[str, Any]] = []
         self.model_providers: dict[str, list[dict[str, Any]]] = {}
         self.extensions: dict[str, list[dict[str, Any]]] = {}
+        self.l3_data_cache_records: dict[str, dict[str, Any]] = {}
+        self.execution_telemetry_log: list[dict[str, Any]] = []
+
+        self.data_cache = MultiTierDataCache(
+            l2_file_path=os.environ.get("APEX_L2_CACHE_FILE"),
+            l3_backing_dict=self.l3_data_cache_records,
+        )
+        self.telemetry_ledger = TelemetryLedger(backing_list=self.execution_telemetry_log)
+        self.execution_router = ExecutionRouter(
+            cache=self.data_cache,
+            telemetry=self.telemetry_ledger,
+        )
 
         self.default_org_id: str = ""
         if seed_demo:
@@ -185,6 +211,8 @@ class ApexPlatformService:
         "usage_records",
         "model_providers",
         "extensions",
+        "l3_data_cache_records",
+        "execution_telemetry_log",
         "default_org_id",
     )
 
@@ -215,6 +243,8 @@ class ApexPlatformService:
                     setattr(self, k, payload[k])
             for org_id, entries in (payload.get("_audit_by_org") or {}).items():
                 self.audit.hydrate_org_entries(org_id, entries)
+            self.data_cache.bind_l3_store(self.l3_data_cache_records)
+            self.telemetry_ledger.bind_store(self.execution_telemetry_log)
             return True
         except Exception:
             return False
@@ -831,6 +861,7 @@ class ApexPlatformService:
             llm_gateway=self.llm_gateway,
             organization_id=organization_id,
             providers_catalog=self._ensure_lmstudio_lan_provider(organization_id),
+            execution_router=self.execution_router,
         )
         self.agent_runs[run_id] = completed_run
         self._persist_run_side_effects(completed_run, user_id=user_id)
@@ -903,6 +934,7 @@ class ApexPlatformService:
             llm_gateway=self.llm_gateway,
             organization_id=organization_id,
             providers_catalog=self._ensure_lmstudio_lan_provider(organization_id),
+            execution_router=self.execution_router,
         )
         if stop_after is not None and advanced["status"] == "INTERRUPTED":
             advanced["status"] = "RUNNING"
@@ -1013,6 +1045,7 @@ class ApexPlatformService:
             llm_gateway=self.llm_gateway,
             organization_id=organization_id,
             providers_catalog=self._ensure_lmstudio_lan_provider(organization_id),
+            execution_router=self.execution_router,
         )
         self.agent_runs[run_id] = resumed
         self._persist_run_side_effects(resumed, user_id=user_id)
@@ -1422,14 +1455,36 @@ class ApexPlatformService:
         max_per_connector: int = 5,
         auto_register_project_id: str | None = None,
         workspace_scope: str = "research",
+        ttl_seconds: int = 1800,
     ) -> dict[str, Any]:
-        """Search external scientific literature APIs and optionally register into project."""
+        """Cache-first search of external scientific literature APIs (Layer B)."""
         self.authorize(user_id=user_id, organization_id=organization_id)
-        discovery = discover_scientific_literature(
-            query=query,
-            connectors=connectors,
-            max_per_connector=max_per_connector,
+        conn_key = ",".join(sorted(connectors or ["arxiv", "openalex", "crossref", "github"]))
+        cache_key = f"lit_discovery:{organization_id}:{query.strip().lower()}:{conn_key}:{max_per_connector}"
+        outcome, _tel, _dec = self.execution_router.fetch_public_data_controlled(
+            agent_name="source-scout",
+            task_id=f"lit:{uuid.uuid4()}",
+            task_category=TaskCategory.PUBLIC_LITERATURE_FETCH,
+            cache_key=cache_key,
+            provider_name=conn_key,
+            ttl_seconds=ttl_seconds,
+            fetcher_fn=lambda: discover_scientific_literature(
+                query=query,
+                connectors=connectors,
+                max_per_connector=max_per_connector,
+            ),
+            validator_fn=lambda d: isinstance(d, dict) and "results" in d,
+            retries=1,
         )
+        discovery = outcome["data"] or {
+            "query": query,
+            "count": 0,
+            "total_found": 0,
+            "providers": {},
+            "connector_statuses": {},
+            "items": [],
+            "results": [],
+        }
         registered: list[dict[str, Any]] = []
         if auto_register_project_id:
             self.authorize(
@@ -1437,15 +1492,24 @@ class ApexPlatformService:
                 organization_id=organization_id,
                 required_permission="sources:write",
             )
+            existing_uris = {
+                str(s.get("uri") or "")
+                for s in self.sources.values()
+                if s.get("organization_id") == organization_id
+                and s.get("research_project_id") == auto_register_project_id
+            }
             for item in discovery["results"]:
                 if not item.get("abstract"):
+                    continue
+                uri_val = item["url"] or f"https://scholar.local/{item['connector']}"
+                if uri_val in existing_uris:
                     continue
                 src = self.register_source(
                     user_id=user_id,
                     organization_id=organization_id,
                     source_type="URL",
                     title=item["title"],
-                    uri_or_filename=item["url"] or f"https://scholar.local/{item['connector']}",
+                    uri_or_filename=uri_val,
                     raw_text=f"{item['title']}\n\n{item['abstract']}",
                     research_project_id=auto_register_project_id,
                     authors=item.get("authors", []),
@@ -1457,8 +1521,45 @@ class ApexPlatformService:
                     },
                     workspace_scope=workspace_scope,
                 )
+                existing_uris.add(uri_val)
                 registered.append(src)
-        return {**discovery, "registered_sources": registered}
+        return {**discovery, "cache_hit": outcome.get("cache_hit", False), "registered_sources": registered}
+
+    def fetch_btc_market_data_controlled(
+        self,
+        *,
+        user_id: str,
+        organization_id: str,
+        ttl_seconds: int = 300,
+        max_age_seconds: float | None = None,
+        market_api_url: str | None = None,
+        allow_stale_on_error: bool = True,
+    ) -> dict[str, Any]:
+        """Cache-first Layer B acquisition of BTC/USD spot & 90D OHLCV (zero LLM)."""
+        self.authorize(user_id=user_id, organization_id=organization_id)
+        cache_key = f"btc_ohlcv_90d:{organization_id}"
+        outcome, tel, decision = self.execution_router.fetch_public_data_controlled(
+            agent_name="source-scout",
+            task_id=f"btc_fetch:{uuid.uuid4()}",
+            task_category=TaskCategory.PUBLIC_MARKET_DATA_FETCH,
+            cache_key=cache_key,
+            provider_name="binance_spot_ohlcv",
+            ttl_seconds=ttl_seconds,
+            max_age_seconds=max_age_seconds,
+            allow_stale_on_error=allow_stale_on_error,
+            fetcher_fn=lambda: fetch_btc_spot_and_ohlcv_http(market_api_url=market_api_url),
+            validator_fn=lambda d: (
+                isinstance(d, dict)
+                and float(d.get("spot_price") or 0.0) > 0.0
+                and isinstance(d.get("bars"), list)
+                and len(d["bars"]) >= 3
+            ),
+        )
+        return {
+            **outcome,
+            "telemetry": tel.to_dict(),
+            "routing_decision": decision.to_dict(),
+        }
 
     def auto_ingest_discovered_sources(
         self,
@@ -1472,9 +1573,51 @@ class ApexPlatformService:
         registered: list[dict[str, Any]] = []
         q_low = query.lower()
         if "bitcoin" in q_low or "btc" in q_low:
-            btc_snap = fetch_live_btc_market_telemetry()
-            if btc_snap is not None:
-                try:
+            btc_outcome = self.fetch_btc_market_data_controlled(
+                user_id=user_id,
+                organization_id=organization_id,
+                ttl_seconds=300,
+            )
+            btc_data = btc_outcome.get("data")
+            if isinstance(btc_data, dict) and btc_data.get("bars"):
+                bars = btc_data["bars"]
+                vol_stats = analyze_ohlcv_and_volatility(bars, window=min(30, len(bars) - 1))
+                md_text = (
+                    f"# Zweryfikowane Dane Rynkowe BTC/USD (Cache-First Layer B)\n"
+                    f"- Kurs spot BTC/USD: ${vol_stats['spot_price']:,.2f}\n"
+                    f"- Zmiana 7D: {vol_stats['return_7d_pct']:+.2f}% | Zmiana 30D: {vol_stats['return_30d_pct']:+.2f}%\n"
+                    f"- Zmienność zrealizowana 30D (annualizowana): {vol_stats['realized_volatility_annual_pct']:.2f}%\n"
+                    f"- Liczba świec dziennych OHLCV: {vol_stats['bars_analyzed']}\n"
+                )
+                digest = compute_sha256_integrity(md_text)["sha256"]
+                already = next(
+                    (
+                        s
+                        for s in self.sources.values()
+                        if s.get("organization_id") == organization_id
+                        and s.get("checksum_sha256") == digest
+                    ),
+                    None,
+                )
+                if already is None:
+                    src = self.register_source(
+                        user_id=user_id,
+                        organization_id=organization_id,
+                        source_type="MD",
+                        title="Live BTC/USD OHLCV & Volatility Feed",
+                        uri_or_filename="btc_usd_live_30d_telemetry.md",
+                        raw_text=md_text,
+                        research_project_id=research_project_id,
+                        metadata_json={
+                            "ohlcv_bars": bars,
+                            "cache_envelope": btc_outcome.get("envelope"),
+                        },
+                        workspace_scope=workspace_scope,
+                    )
+                    registered.append(src)
+            else:
+                btc_snap = fetch_live_btc_market_telemetry()
+                if btc_snap is not None:
                     src = self.register_source(
                         user_id=user_id,
                         organization_id=organization_id,
@@ -1486,8 +1629,6 @@ class ApexPlatformService:
                         workspace_scope=workspace_scope,
                     )
                     registered.append(src)
-                except Exception:
-                    pass
             scholar_q = "Bitcoin volatility drawdown 30-day GARCH prediction"
         else:
             scholar_q = query
@@ -1503,6 +1644,108 @@ class ApexPlatformService:
         )
         registered.extend(res.get("registered_sources", []))
         return registered
+
+    def get_local_first_telemetry(
+        self,
+        *,
+        user_id: str,
+        organization_id: str,
+    ) -> dict[str, Any]:
+        """Return mandatory aggregate & recent step-level Local-First telemetry (Section 7)."""
+        self.authorize(user_id=user_id, organization_id=organization_id)
+        summary = self.telemetry_ledger.summarize()
+        return {
+            "architecture_policy": "LOCAL-FIRST. EXTERNAL API ONLY WHEN JUSTIFIED.",
+            "summary": summary,
+            "recent_steps": list(reversed(self.execution_telemetry_log[-50:])),
+            "cache_records_count": len(self.l3_data_cache_records),
+            "agent_contracts": {
+                slug: contract.model_dump()
+                for slug, contract in BUILTIN_AGENT_CONTRACTS.items()
+            },
+        }
+
+    def execute_local_first_task(
+        self,
+        *,
+        user_id: str,
+        organization_id: str,
+        operation: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Execute an explicit Layer A / Layer B task through `ExecutionRouter`."""
+        self.authorize(user_id=user_id, organization_id=organization_id)
+        op = operation.strip().lower()
+        if op == "sha256":
+            res, tel, dec = self.execution_router.execute_local_task(
+                agent_name="local-engine",
+                task_id=f"sha256:{uuid.uuid4()}",
+                task_category=TaskCategory.CHECKSUM_HASH,
+                fn=lambda: compute_sha256_integrity(payload.get("data", "")),
+                requested_llm=bool(payload.get("requested_llm", False)),
+            )
+        elif op == "validate_data":
+            res, tel, dec = self.execution_router.execute_local_task(
+                agent_name="local-engine",
+                task_id=f"validate:{uuid.uuid4()}",
+                task_category=TaskCategory.SCHEMA_VALIDATION,
+                fn=lambda: validate_and_parse_structured_data(
+                    str(payload.get("raw", "")),
+                    fmt=payload.get("format", "auto"),
+                    required_fields=payload.get("required_fields"),
+                ),
+            )
+        elif op == "csv_analysis":
+            res, tel, dec = self.execution_router.execute_local_task(
+                agent_name="data-analyst",
+                task_id=f"csv:{uuid.uuid4()}",
+                task_category=TaskCategory.CSV_STATISTICAL_ANALYSIS,
+                fn=lambda: analyze_tabular_csv_statistics(str(payload.get("csv", ""))),
+                requested_llm=bool(payload.get("requested_llm", False)),
+            )
+        elif op == "ohlcv_volatility":
+            res, tel, dec = self.execution_router.execute_local_task(
+                agent_name="data-analyst",
+                task_id=f"vol:{uuid.uuid4()}",
+                task_category=TaskCategory.OHLCV_VOLATILITY,
+                fn=lambda: analyze_ohlcv_and_volatility(
+                    list(payload.get("ohlcv") or []),
+                    window=int(payload.get("window", 30)),
+                ),
+                requested_llm=bool(payload.get("requested_llm", False)),
+            )
+        elif op == "monte_carlo":
+            res, tel, dec = self.execution_router.execute_local_task(
+                agent_name="data-analyst",
+                task_id=f"mc:{uuid.uuid4()}",
+                task_category=TaskCategory.MONTE_CARLO_SIMULATION,
+                fn=lambda: run_monte_carlo_simulation(
+                    spot_price=float(payload["spot_price"]),
+                    daily_volatility=float(payload["daily_volatility"]),
+                    daily_drift=float(payload.get("daily_drift", 0.0)),
+                    horizon_days=int(payload.get("horizon_days", 30)),
+                    num_paths=int(payload.get("num_paths", 10_000)),
+                    seed=int(payload.get("seed", 42)),
+                    historical_log_returns=payload.get("historical_log_returns"),
+                ),
+                requested_llm=bool(payload.get("requested_llm", False)),
+            )
+        elif op == "btc_price":
+            return self.fetch_btc_market_data_controlled(
+                user_id=user_id,
+                organization_id=organization_id,
+                ttl_seconds=int(payload.get("ttl_seconds", 300)),
+                max_age_seconds=payload.get("max_age_seconds"),
+                market_api_url=payload.get("market_api_url"),
+                allow_stale_on_error=bool(payload.get("allow_stale_on_error", True)),
+            )
+        else:
+            raise ValueError(f"Unsupported local-first operation '{operation}'.")
+        return {
+            "result": res,
+            "telemetry": tel.to_dict(),
+            "routing_decision": dec.to_dict(),
+        }
 
     def create_claim_and_evidence(
         self,
@@ -2932,11 +3175,13 @@ class ApexPlatformService:
         org_id = mem["organization_id"]
         providers = self.model_providers.get(org_id, [])
         built: list[dict[str, Any]] = []
+        allow_ext_emb = os.environ.get("APEX_ENABLE_EXTERNAL_EMBEDDINGS", "").lower() == "true"
         for idx, ch_text in enumerate(raw_chunks):
             vec, backend_name = self.llm_gateway.embed_text_1536_with_live_provider(
                 ch_text,
                 organization_id=org_id,
                 providers_catalog=providers,
+                allow_external_cloud=allow_ext_emb,
             )
             built.append(
                 {
@@ -2960,16 +3205,25 @@ class ApexPlatformService:
     ) -> None:
         org_id = run_data["organization_id"]
         if run_data["status"] == "COMPLETED":
+            step_tels = [
+                (s.get("output_json") or {}).get("telemetry") or {}
+                for s in (run_data.get("steps") or [])
+            ]
+            exact_prompt_tok = sum(int(t.get("input_tokens") or 0) for t in step_tels)
+            exact_comp_tok = sum(int(t.get("output_tokens") or 0) for t in step_tels)
+            llm_tels = [t for t in step_tels if t.get("llm_invoked")]
+            used_prov = str(llm_tels[-1].get("provider")) if llm_tels else "local_python"
+            used_mod = str(llm_tels[-1].get("model")) if llm_tels else "none"
             self.usage_records.append(
                 {
                     "id": str(uuid.uuid4()),
                     "organization_id": org_id,
                     "agent_run_id": run_data["id"],
-                    "model_identifier": "apex-analytical-local-v1",
-                    "provider_name": "apex-analytical",
-                    "prompt_tokens": int(run_data["tokens_used"] * 0.65),
-                    "completion_tokens": int(run_data["tokens_used"] * 0.35),
-                    "total_tokens": int(run_data["tokens_used"]),
+                    "model_identifier": used_mod,
+                    "provider_name": used_prov,
+                    "prompt_tokens": exact_prompt_tok,
+                    "completion_tokens": exact_comp_tok,
+                    "total_tokens": exact_prompt_tok + exact_comp_tok,
                     "cost_usd": float(run_data["cost_usd"]),
                     "latency_ms": int(run_data["duration_ms"]),
                     "tool_calls_count": len(run_data.get("tool_invocations", [])),

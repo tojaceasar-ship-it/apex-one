@@ -28,6 +28,7 @@ import httpx
 from apex_one.db.models import DEFAULT_EMBEDDING_DIM as EMBEDDING_DIM
 from apex_one.integrations_hub import SSRFBlockedError, assert_public_http_url
 from apex_one.platform.lan_llm_bridge import LanLLMBridgeBroker
+from apex_one.platform.local_intelligence import redact_confidential_text
 from apex_one.platform.memory_and_docs import embed_text_1536
 
 
@@ -504,13 +505,14 @@ class LLMGateway:
         *,
         organization_id: str,
         providers_catalog: list[dict[str, Any]],
+        allow_external_cloud: bool = True,
     ) -> tuple[list[float], str]:
-        """Generate a 1536-d semantic vector via OpenAI or Ollama when configured, else local."""
+        """Generate a 1536-d semantic vector locally by default or via configured provider."""
         for prov in providers_catalog:
             if not prov.get("enabled", True):
                 continue
             slug = str(prov.get("slug") or "")
-            if slug in {"openai", "openai-compatible-cloud"}:
+            if allow_external_cloud and slug in {"openai", "openai-compatible-cloud"}:
                 api_key = self.resolve_api_key(
                     organization_id=organization_id, provider_cfg=prov
                 )
@@ -523,13 +525,14 @@ class LLMGateway:
                     )
                     try:
                         _validate_llm_endpoint(url)
+                        safe_input = redact_confidential_text(text[:8000], for_external_cloud=True)
                         with httpx.Client(timeout=12.0, verify=ssl.create_default_context()) as client:
                             r = client.post(
                                 url,
                                 headers={"Authorization": f"Bearer {api_key}"},
                                 json={
                                     "model": "text-embedding-3-small",
-                                    "input": text[:8000],
+                                    "input": safe_input,
                                     "dimensions": EMBEDDING_DIM,
                                 },
                             )

@@ -900,6 +900,20 @@ export function RunsExecutionsPage() {
                   Tryb: {r.execution_mode} · Runtime: {r.runtime_adapter} · Tokeny:{" "}
                   {r.tokens_used} · Koszt: ${r.cost_usd.toFixed(5)} · Narzędzia:{" "}
                   {r.tool_invocations?.length || 0}
+                  {r.local_first_telemetry && (
+                    <>
+                      {" "}
+                      · Lokalnie:{" "}
+                      <b className="text-emerald-300">
+                        {r.local_first_telemetry.local_operations_pct}%
+                      </b>{" "}
+                      ({r.local_first_telemetry.local_operations_count}/
+                      {r.local_first_telemetry.total_operations}) · Wywołania LLM:{" "}
+                      <b className="text-indigo-300">
+                        {r.local_first_telemetry.llm_invocations_count}
+                      </b>
+                    </>
+                  )}
                 </div>
               </div>
 
@@ -953,6 +967,11 @@ export function RunsExecutionsPage() {
                   <div className="mt-1 truncate text-[11px] text-zinc-400">
                     {st.task_title}
                   </div>
+                  {st.output_json?.execution_mode && (
+                    <div className="mt-1 font-mono text-[10px] text-emerald-400/90">
+                      {st.output_json.execution_mode}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
