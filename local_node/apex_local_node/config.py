@@ -6,8 +6,10 @@ import socket
 import uuid
 from pathlib import Path
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_DEV_NODE_SECRET = "dev-local-node-protocol-test-secret-32b"
 
 
 class LocalNodeSettings(BaseSettings):
@@ -18,6 +20,7 @@ class LocalNodeSettings(BaseSettings):
         populate_by_name=True,
     )
 
+    env: str = Field(default="development", validation_alias="APEX_ENV")
     cloud_url: str = Field(
         default="http://127.0.0.1:8000",
         validation_alias="APEX_NODE_CLOUD_URL",
@@ -34,10 +37,41 @@ class LocalNodeSettings(BaseSettings):
         default=uuid.UUID("00000000-0000-0000-0000-000000000001"),
         validation_alias="APEX_NODE_TENANT_ID",
     )
-    shared_secret: SecretStr = Field(
-        default=SecretStr("dev-local-node-protocol-test-secret-32b"),
+    credential_id: str | None = Field(
+        default=None,
+        validation_alias="APEX_NODE_CREDENTIAL_ID",
+    )
+    shared_secret: SecretStr | None = Field(
+        default=None,
         validation_alias="APEX_NODE_SHARED_SECRET",
     )
+
+    @property
+    def effective_secret(self) -> str:
+        if self.shared_secret is not None and self.shared_secret.get_secret_value().strip():
+            return self.shared_secret.get_secret_value().strip()
+        if self.env.strip().lower() in {"staging", "production"}:
+            raise ValueError(
+                f"Environment '{self.env}' requires explicit APEX_NODE_SHARED_SECRET."
+            )
+        return _DEV_NODE_SECRET
+
+    @model_validator(mode="after")
+    def _validate_node_secret(self) -> LocalNodeSettings:
+        norm_env = self.env.strip().lower()
+        if norm_env in {"staging", "production"}:
+            if self.shared_secret is None or not self.shared_secret.get_secret_value().strip():
+                raise ValueError(
+                    f"Environment '{norm_env}' requires explicit APEX_NODE_SHARED_SECRET."
+                )
+            raw = self.shared_secret.get_secret_value().strip()
+            if raw == _DEV_NODE_SECRET or len(raw) < 32 or len(set(raw)) < 10:
+                raise ValueError(
+                    f"Environment '{norm_env}' rejects default or low-entropy APEX_NODE_SHARED_SECRET."
+                )
+        elif self.shared_secret is None:
+            self.shared_secret = SecretStr(_DEV_NODE_SECRET)
+        return self
     workspace_root: Path = Field(
         default_factory=lambda: Path.cwd(),
         validation_alias="APEX_NODE_WORKSPACE_ROOT",

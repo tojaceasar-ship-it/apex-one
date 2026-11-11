@@ -43,15 +43,13 @@ python3 -m venv .venv
 npm install
 
 # 3. Uruchomienie API (0.0.0.0:8000) oraz Workbench UI (0.0.0.0:5173)
+# Domyślnie aplikacja startuje bez kont demonstracyjnych (APEX_ENABLE_DEMO_SEED=false).
+# Pierwszą organizację i konto właściciela utworzysz w formularzu /register.
 .venv/bin/uvicorn apex_one.api.main:app --host 0.0.0.0 --port 8000 &
 npm run dev:web
 ```
 
-Konta laboratoryjne zasiane w trybie deweloperskim (hasło: `ApexResearch!2026`):
-- `admin@apex-one.local` — rola `Owner`
-- `researcher@apex-one.local` — rola `Researcher`
-- `evaluator@apex-one.local` — rola `Evaluator`
-- `viewer@apex-one.local` — rola `Viewer`
+> **Uwaga bezpieczeństwa (HARDENING 1.0):** Konta demonstracyjne **nie są** tworzone podczas domyślnego uruchomienia serwera i są bezwarunkowo zablokowane w środowiskach `staging` oraz `production`. Opcjonalny zbiór demonstracyjny można włączyć wyłącznie lokalnie w trybie `APEX_ENV=development` z jawną flagą `APEX_ENABLE_DEMO_SEED=true` oraz własnym hasłem testowym `APEX_DEV_DEMO_PASSWORD`.
 
 ### Wariant B — Wdrożenie kontenerowe (PostgreSQL 16 + pgvector + Backend + Worker + Web)
 

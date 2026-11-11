@@ -13,7 +13,7 @@ pytestmark = pytest.mark.api
 
 
 async def test_unauthenticated_and_unauthorized_role_and_cross_tenant_blocked() -> None:
-    app = create_app(Settings(env="development"))
+    app = create_app(Settings(env="development"), seed_demo=True)
     transport = httpx.ASGITransport(app=app)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -73,7 +73,7 @@ async def test_unauthenticated_and_unauthorized_role_and_cross_tenant_blocked() 
 
 
 async def test_csrf_audit_immutability_parameter_invalidation_and_emergency_stop() -> None:
-    app = create_app(Settings(env="development"))
+    app = create_app(Settings(env="development"), seed_demo=True)
     transport = httpx.ASGITransport(app=app)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

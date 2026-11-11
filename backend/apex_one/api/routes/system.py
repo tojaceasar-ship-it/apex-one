@@ -60,11 +60,32 @@ async def environment_status(
     return {
         "verdict": verdict,
         "environment_profile": container.settings.env,
+        "demo_seed_active": container.platform.demo_seeded,
         "docker_required_for_dev": False,
         "apt_required_for_dev": False,
         "env_var_presence": env_presence,
         "postgresql": asdict(db_report),
         "redis": asdict(cache_report),
+        "rate_limiter": container.rate_limiter.telemetry_snapshot(),
+        "persistence_and_concurrency": {
+            "authoritative_store": (
+                "postgresql_rls_occ"
+                if container.platform_persistence.active
+                else "single_instance_local_checkpoint"
+            ),
+            "optimistic_concurrency_control": True,
+            "idempotency_ledger_enabled": True,
+            "atomic_fsync_checkpointing": True,
+            "multi_instance_safe": bool(container.platform_persistence.active),
+            "ephemeral_shared_state": (
+                "redis" if cache_report.connected else "process_local"
+            ),
+            "architecture_note": (
+                "PostgreSQL with RLS + version_num OCC is authoritative across replicas."
+                if container.platform_persistence.active
+                else "Single-instance mode: local atomic checkpoint active; configure APEX_DATABASE_URL for multi-instance horizontal scaling."
+            ),
+        },
         "worker_outbox": {
             "mode": "postgresql_transactional_outbox",
             "daemon_assumed": False,

@@ -55,6 +55,12 @@ from typing import Any, Literal
 import httpx
 from pydantic import BaseModel, Field, ValidationError
 
+from apex_one.platform.cost_attribution import (
+    PRICING_CATALOG_VERSION,
+    CostCategory,
+    CostStatus,
+)
+
 try:
     import numpy as np
 
@@ -1089,8 +1095,8 @@ class ExecutionStepTelemetry:
     cache_tier: str
     input_tokens: int
     output_tokens: int
-    actual_cost_usd: float
-    estimated_cost: float
+    actual_cost_usd: float | None
+    estimated_cost: float | None
     cost_is_estimated: bool
     latency_ms: float
     execution_status: str
@@ -1099,9 +1105,41 @@ class ExecutionStepTelemetry:
     llm_justification: str | None = None
     idempotency_key: str | None = None
     recorded_at: str = field(default_factory=lambda: _utcnow().isoformat())
+    # Stage 7 (P2) mandatory 16-field per-call cost attribution fields:
+    execution_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    workflow_run_id: str = ""
+    step_id: str = ""
+    agent_id: str = ""
+    cached_tokens: int = 0
+    estimated_cost_usd: float | None = None
+    pricing_version: str = PRICING_CATALOG_VERSION
+    request_id: str = field(default_factory=lambda: f"req_{uuid.uuid4().hex[:16]}")
+    invocation_timestamp: str = field(default_factory=lambda: _utcnow().isoformat())
+    cost_category: str = CostCategory.LOCAL_COMPUTE.value
+    cost_status: str = CostStatus.LOCAL_ZERO_API_COST.value
+
+    def __post_init__(self) -> None:
+        if not self.agent_id:
+            self.agent_id = self.agent_name
+        if not self.step_id:
+            self.step_id = self.task_id
+        if self.estimated_cost_usd is None and self.estimated_cost is not None:
+            self.estimated_cost_usd = self.estimated_cost
+        if self.cache_hit:
+            self.cost_status = CostStatus.CACHE_HIT_ZERO_COST.value
+            self.actual_cost_usd = 0.0
+            self.estimated_cost_usd = 0.0
+            self.estimated_cost = 0.0
+        elif self.external_api_invoked and not self.llm_invoked:
+            if self.cost_category == CostCategory.LOCAL_COMPUTE.value:
+                self.cost_category = CostCategory.PUBLIC_DATA_API.value
+            if self.cost_status == CostStatus.LOCAL_ZERO_API_COST.value:
+                self.cost_status = CostStatus.KNOWN_ACTUAL.value
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d["total_tokens"] = int(self.input_tokens) + int(self.output_tokens)
+        return d
 
 
 class TelemetryLedger:
@@ -1160,16 +1198,33 @@ class TelemetryLedger:
         cost_by_agent: dict[str, float] = {}
         actual_total = 0.0
         est_total = 0.0
+        unknown_cost_calls = 0
+        cached_tokens_total = 0
         unnecessary_executed = 0
 
         for r in rows:
             prov = str(r.get("provider") or "local")
-            ag = str(r.get("agent_name") or "system")
-            act_c = float(r.get("actual_cost_usd") or 0.0)
-            est_c = float(r.get("estimated_cost") or 0.0)
-            actual_total += act_c
-            est_total += est_c
-            eff_c = act_c if not r.get("cost_is_estimated") else est_c
+            ag = str(r.get("agent_name") or r.get("agent_id") or "system")
+            cached_tokens_total += int(r.get("cached_tokens") or 0)
+            if r.get("cost_status") == CostStatus.UNKNOWN.value:
+                unknown_cost_calls += 1
+            if r.get("cache_hit"):
+                eff_c = 0.0
+            else:
+                raw_act = r.get("actual_cost_usd")
+                raw_est = (
+                    r.get("estimated_cost_usd")
+                    if r.get("estimated_cost_usd") is not None
+                    else r.get("estimated_cost")
+                )
+                act_c = float(raw_act) if raw_act is not None else 0.0
+                est_c = float(raw_est) if raw_est is not None else 0.0
+                if not r.get("cost_is_estimated") and raw_act is not None:
+                    actual_total += act_c
+                    eff_c = act_c
+                else:
+                    est_total += est_c
+                    eff_c = est_c
             cost_by_prov[prov] = round(cost_by_prov.get(prov, 0.0) + eff_c, 6)
             cost_by_agent[ag] = round(cost_by_agent.get(ag, 0.0) + eff_c, 6)
             cat = str(r.get("task_category") or "")
@@ -1185,8 +1240,11 @@ class TelemetryLedger:
             "llm_invocations_count": llm_calls,
             "public_api_invocations_count": pub_api_calls,
             "cache_hits_count": cache_hits,
+            "cached_tokens_total": cached_tokens_total,
             "actual_cost_usd_total": round(actual_total, 6),
             "estimated_cost_usd_total": round(est_total, 6),
+            "unknown_cost_calls_count": unknown_cost_calls,
+            "has_unknown_pricing": unknown_cost_calls > 0,
             "cost_by_provider": cost_by_prov,
             "cost_by_agent": cost_by_agent,
             "average_latency_ms": round(avg_lat, 2),
@@ -1968,7 +2026,31 @@ class ExecutionRouter:
                 if decision.selected_mode == ExecutionMode.HYBRID
                 else (ExecutionMode.EXTERNAL_LLM.value if used_is_cloud else ExecutionMode.LOCAL_MODEL.value)
             )
-            is_zero_cost_local = llm_res.cost_usd == 0.0 and not used_is_cloud
+            res_cost_status = getattr(
+                llm_res,
+                "cost_status",
+                CostStatus.LOCAL_ZERO_API_COST.value
+                if not used_is_cloud
+                else CostStatus.KNOWN_TARIFF_ESTIMATE.value,
+            )
+            res_cost_cat = getattr(
+                llm_res,
+                "cost_category",
+                CostCategory.CLOUD_LLM_API.value
+                if used_is_cloud
+                else CostCategory.LOCAL_LLM_API.value,
+            )
+            res_actual_cost = getattr(llm_res, "actual_cost_usd", None)
+            res_est_cost = getattr(llm_res, "estimated_cost_usd", llm_res.cost_usd)
+            res_cached_tok = int(getattr(llm_res, "cached_tokens", 0) or 0)
+            res_pricing_ver = str(
+                getattr(llm_res, "pricing_version", PRICING_CATALOG_VERSION)
+            )
+            res_req_id = (
+                getattr(llm_res, "request_id", None)
+                or f"req_{uuid.uuid4().hex[:16]}"
+            )
+            cost_is_est = res_cost_status == CostStatus.KNOWN_TARIFF_ESTIMATE.value
             out = {
                 **local_result,
                 "execution_mode": actual_mode,
@@ -1979,6 +2061,9 @@ class ExecutionRouter:
                 "fallback_triggered": llm_res.fallback_triggered,
                 "llm_reasoning": llm_res.content[:3000],
                 "llm_justification": decision.llm_justification,
+                "cost_status": res_cost_status,
+                "cost_category": res_cost_cat,
+                "pricing_version": res_pricing_ver,
             }
             tel = ExecutionStepTelemetry(
                 agent_name=agent_name,
@@ -1993,15 +2078,21 @@ class ExecutionRouter:
                 cache_tier="NONE",
                 input_tokens=llm_res.prompt_tokens,
                 output_tokens=llm_res.completion_tokens,
-                actual_cost_usd=0.0,
-                estimated_cost=llm_res.cost_usd,
-                cost_is_estimated=not is_zero_cost_local,
+                actual_cost_usd=res_actual_cost,
+                estimated_cost=res_est_cost,
+                cost_is_estimated=cost_is_est,
                 latency_ms=lat,
                 execution_status="SUCCEEDED",
                 validation_status="VALIDATED",
                 routing_reason=decision.reason,
                 llm_justification=decision.llm_justification,
                 idempotency_key=idempotency_key,
+                cached_tokens=res_cached_tok,
+                estimated_cost_usd=res_est_cost,
+                pricing_version=res_pricing_ver,
+                request_id=res_req_id,
+                cost_category=res_cost_cat,
+                cost_status=res_cost_status,
             )
             self.telemetry.record(tel)
             if budget and idempotency_key:

@@ -27,17 +27,21 @@ def build_local_node_router(registry: LocalNodeGatewayRegistry) -> APIRouter:
         x_apex_node_timestamp: str | None = Header(default=None),
         x_apex_node_nonce: str | None = Header(default=None),
         x_apex_node_signature: str | None = Header(default=None),
+        x_apex_node_credential_id: str | None = Header(default=None),
     ) -> dict[str, object]:
         raw_body: dict[str, Any] = await request.json()
         try:
-            registry.verify_signed_request(
+            verified_cred_id = registry.verify_signed_request(
                 timestamp_header=x_apex_node_timestamp,
                 nonce_header=x_apex_node_nonce,
                 signature_header=x_apex_node_signature,
+                credential_id_header=x_apex_node_credential_id,
                 payload=raw_body,
             )
             parsed = HandshakeRequest.model_validate(raw_body)
-            state = registry.register_handshake(parsed)
+            state = registry.register_handshake(
+                parsed, verified_credential_id=verified_cred_id
+            )
         except PermissionError as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
         except ValueError as exc:
@@ -46,6 +50,7 @@ def build_local_node_router(registry: LocalNodeGatewayRegistry) -> APIRouter:
         return {
             "protocol_version": SUPPORTED_PROTOCOL_VERSION,
             "node_id": state.node_id,
+            "credential_id": state.credential_id,
             "session_token": state.session_token,
             "registered_at": state.registered_at.isoformat(),
             "arena_isolated_mode": registry.arena_isolated_mode,
@@ -59,6 +64,7 @@ def build_local_node_router(registry: LocalNodeGatewayRegistry) -> APIRouter:
         x_apex_node_timestamp: str | None = Header(default=None),
         x_apex_node_nonce: str | None = Header(default=None),
         x_apex_node_signature: str | None = Header(default=None),
+        x_apex_node_credential_id: str | None = Header(default=None),
     ) -> dict[str, object]:
         raw_body: dict[str, Any] = await request.json()
         bearer = None
@@ -70,6 +76,7 @@ def build_local_node_router(registry: LocalNodeGatewayRegistry) -> APIRouter:
                 timestamp_header=x_apex_node_timestamp,
                 nonce_header=x_apex_node_nonce,
                 signature_header=x_apex_node_signature,
+                credential_id_header=x_apex_node_credential_id,
                 payload=raw_body,
             )
             parsed = HeartbeatRequest.model_validate(raw_body)

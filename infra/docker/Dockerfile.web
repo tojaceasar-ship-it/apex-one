@@ -6,8 +6,10 @@ COPY packages/agent-runtime/package.json ./packages/agent-runtime/
 COPY apps/web/package.json ./apps/web/
 RUN npm ci
 
-COPY packages/agent-runtime ./packages/agent-runtime
-COPY apps/web ./apps/web
+COPY --chown=node:node packages/agent-runtime ./packages/agent-runtime
+COPY --chown=node:node apps/web ./apps/web
+RUN chown -R node:node /app
 
+USER node
 EXPOSE 5173
 CMD ["npm", "--workspace", "@apex-one/web", "run", "dev", "--", "--host", "0.0.0.0"]

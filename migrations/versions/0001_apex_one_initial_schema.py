@@ -345,13 +345,19 @@ def upgrade() -> None:
         "ix_local_node_sessions_tenant_id", "local_node_sessions", ["tenant_id"]
     )
 
-    # 10. Enforce PostgreSQL Row-Level Security (RLS) on all tenant-scoped tables
-    for stmt in build_enable_rls_statements(RLS_PROTECTED_TABLES):
+    # 10. Enforce PostgreSQL Row-Level Security (RLS) on all 0001 tenant-scoped tables
+    rls_0001_tables = tuple(
+        t for t in RLS_PROTECTED_TABLES if t != "local_node_credentials"
+    )
+    for stmt in build_enable_rls_statements(rls_0001_tables):
         op.execute(stmt)
 
 
 def downgrade() -> None:
-    for stmt in build_disable_rls_statements(RLS_PROTECTED_TABLES):
+    rls_0001_tables = tuple(
+        t for t in RLS_PROTECTED_TABLES if t != "local_node_credentials"
+    )
+    for stmt in build_disable_rls_statements(rls_0001_tables):
         op.execute(stmt)
 
     op.drop_table("local_node_sessions")

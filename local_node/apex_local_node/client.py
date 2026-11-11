@@ -34,28 +34,35 @@ class LocalNodeClient:
         return self._session_token
 
     def build_handshake_payload(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "protocol_version": PROTOCOL_VERSION,
             "node_id": self._settings.node_id,
             "node_name": self._settings.node_name,
             "tenant_id": str(self._settings.tenant_id),
             "capabilities": discover_node_capabilities(),
         }
+        if self._settings.credential_id:
+            payload["credential_id"] = self._settings.credential_id
+        return payload
 
     def build_heartbeat_payload(self, *, active_tasks: int = 0) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "protocol_version": PROTOCOL_VERSION,
             "node_id": self._settings.node_id,
             "tenant_id": str(self._settings.tenant_id),
             "status": "BUSY" if active_tasks > 0 else "ONLINE",
             "active_tasks": active_tasks,
         }
+        if self._settings.credential_id:
+            payload["credential_id"] = self._settings.credential_id
+        return payload
 
     async def handshake(self) -> dict[str, Any]:
         payload = self.build_handshake_payload()
         headers = build_signed_headers(
-            self._settings.shared_secret.get_secret_value(),
+            self._settings.effective_secret,
             payload,
+            credential_id=self._settings.credential_id,
         )
         base = self._settings.cloud_url.rstrip("/")
         owns_client = self._http_client is None
@@ -84,8 +91,9 @@ class LocalNodeClient:
             raise LocalNodeProtocolError("Cannot send heartbeat prior to handshake.")
         payload = self.build_heartbeat_payload(active_tasks=active_tasks)
         headers = build_signed_headers(
-            self._settings.shared_secret.get_secret_value(),
+            self._settings.effective_secret,
             payload,
+            credential_id=self._settings.credential_id,
         )
         headers["Authorization"] = f"Bearer {self._session_token}"
         base = self._settings.cloud_url.rstrip("/")

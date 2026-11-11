@@ -183,6 +183,7 @@ def wire_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[
         provider_slug="openai",
         api_key="sk-realwiretestkey123456",
         base_url=servers.llm_base_url,
+        allow_dev_loopback=True,
     )
     # Disable unconfigured LAN 192.168.18.184 seed during wire tests so `openai` loopback wire server is primary
     for p in svc.model_providers.get(oid, []):
@@ -547,6 +548,7 @@ async def test_10_full_btc_research_workflow_e2e_over_fastapi(
             provider_slug="openai",
             api_key="sk-realwiretestkey123456",
             base_url=servers.llm_base_url,
+            allow_dev_loopback=True,
         )
 
         # Pre-cache literature discovery so test isolates deterministic + BTC market API + LLM wire counts cleanly

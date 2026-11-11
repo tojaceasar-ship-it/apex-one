@@ -33,6 +33,7 @@ RLS_PROTECTED_TABLES: tuple[str, ...] = (
     "outbox_events",
     "sandbox_job_records",
     "local_node_sessions",
+    "local_node_credentials",
 )
 
 
@@ -291,3 +292,28 @@ class LocalNodeSession(Base, TenantScopedMixin):
         server_default=func.now(),
         nullable=False,
     )
+
+
+class LocalNodeCredential(Base, TenantScopedMixin):
+    __tablename__ = "local_node_credentials"
+
+    credential_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    node_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    secret_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    key_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="ACTIVE", index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        server_default=func.now(),
+        nullable=False,
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    rotated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+

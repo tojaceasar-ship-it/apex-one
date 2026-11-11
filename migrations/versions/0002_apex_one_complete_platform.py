@@ -44,6 +44,8 @@ MIGRATION_0003_TABLES = frozenset(
     {
         "platform_identity_directory",
         "organization_workspace_states",
+        "local_node_credentials",
+        "idempotency_records",
     }
 )
 

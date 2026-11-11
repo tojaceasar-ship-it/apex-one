@@ -1,7 +1,6 @@
 import React, { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import {
-  ArrowRight,
   Bot,
   CheckCircle2,
   Eye,
@@ -15,50 +14,11 @@ import {
 import { ApexPrismLogo } from "../components/Layout";
 import { useAuth } from "../context/AuthContext";
 
-const SEEDED_LAB_ACCOUNTS = [
-  {
-    email: "admin@apex-one.local",
-    role: "Owner",
-    initials: "AK",
-    label: "Dr Anna Kowalska",
-    descPl: "Pełny nadzór organizacji, R2/R3 i Emergency Stop",
-    descEn: "Full org governance, R2/R3 & Emergency Stop",
-    badgeClass: "bg-indigo-500/20 text-indigo-200 border-indigo-400/35",
-  },
-  {
-    email: "researcher@apex-one.local",
-    role: "Researcher",
-    initials: "PN",
-    label: "Mgr Piotr Nowak",
-    descPl: "Projekty badawcze, Zespół 8 Agentów i Graf Dowodowy",
-    descEn: "Research projects, 8-Agent Team & Evidence Graph",
-    badgeClass: "bg-emerald-500/20 text-emerald-200 border-emerald-400/35",
-  },
-  {
-    email: "evaluator@apex-one.local",
-    role: "Evaluator",
-    initials: "EW",
-    label: "Dr Ewa Wiśniewska",
-    descPl: "Benchmarki 9-kategorialne i oceny eksperckie",
-    descEn: "9-category benchmarks & human evaluation reviews",
-    badgeClass: "bg-violet-500/20 text-violet-200 border-violet-400/35",
-  },
-  {
-    email: "viewer@apex-one.local",
-    role: "Viewer",
-    initials: "TZ",
-    label: "Tomasz Zieliński",
-    descPl: "Dostęp audytowy tylko do odczytu (RBAC Read-Only)",
-    descEn: "Read-only audit observer access",
-    badgeClass: "bg-zinc-700/50 text-zinc-300 border-white/15",
-  },
-];
-
 export function LoginPage() {
   const { loginWithCredentials, locale, setLocale, t } = useAuth();
   const navigate = useNavigate();
-  const [email, setEmail] = useState("admin@apex-one.local");
-  const [password, setPassword] = useState("ApexResearch!2026");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -257,6 +217,7 @@ export function LoginPage() {
               </label>
               <input
                 type="email"
+                aria-label="Email"
                 required
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
@@ -271,6 +232,7 @@ export function LoginPage() {
               <div className="relative">
                 <input
                   type={showPassword ? "text" : "password"}
+                  aria-label="Password"
                   required
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
@@ -301,75 +263,6 @@ export function LoginPage() {
               {busy ? "..." : t.auth.signInBtn}
             </button>
           </form>
-
-          {/* Seeded Persona Cards */}
-          <div className="mt-6 border-t border-white/[0.07] pt-5">
-            <div className="mb-2.5 flex items-center justify-between text-xs">
-              <span className="flex items-center gap-1.5 font-medium text-zinc-300">
-                <ShieldCheck className="h-3.5 w-3.5 text-indigo-400" />
-                {t.auth.quickAccounts}
-              </span>
-              <span className="text-[10px] text-zinc-500">
-                {locale === "pl" ? "Kliknij, aby wybrać lub wejść" : "Click to select"}
-              </span>
-            </div>
-
-            <div className="space-y-2">
-              {SEEDED_LAB_ACCOUNTS.map((acc) => {
-                const selected = email === acc.email;
-                return (
-                  <div
-                    key={acc.email}
-                    onClick={() => {
-                      setEmail(acc.email);
-                      setPassword("ApexResearch!2026");
-                    }}
-                    className={`group flex cursor-pointer items-center justify-between gap-2.5 rounded-xl border p-2.5 transition-all ${
-                      selected
-                        ? "border-indigo-400/45 bg-indigo-500/12 shadow-xs"
-                        : "border-white/[0.06] bg-white/[0.02] hover:border-white/15 hover:bg-white/[0.04]"
-                    }`}
-                  >
-                    <div className="flex min-w-0 items-center gap-2.5">
-                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-white/[0.06] text-[11px] font-bold text-zinc-200 ring-1 ring-white/10">
-                        {acc.initials}
-                      </div>
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="truncate text-xs font-semibold text-zinc-100">
-                            {acc.label}
-                          </span>
-                          <span
-                            className={`rounded-full border px-2 py-0.2 text-[10px] font-medium ${acc.badgeClass}`}
-                          >
-                            {acc.role}
-                          </span>
-                        </div>
-                        <div className="truncate text-[11px] text-zinc-400">
-                          {locale === "pl" ? acc.descPl : acc.descEn}
-                        </div>
-                      </div>
-                    </div>
-
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={(ev) => {
-                        ev.stopPropagation();
-                        setEmail(acc.email);
-                        setPassword("ApexResearch!2026");
-                        void performLogin(acc.email, "ApexResearch!2026");
-                      }}
-                      title={locale === "pl" ? "Szybkie wejście" : "Instant sign-in"}
-                      className="shrink-0 rounded-lg border border-white/10 bg-white/[0.05] p-1.5 text-zinc-300 opacity-80 transition hover:border-indigo-400/50 hover:bg-indigo-500/20 hover:text-white group-hover:opacity-100"
-                    >
-                      <ArrowRight className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
 
           <div className="mt-5 text-center text-xs text-zinc-400">
             <Link
