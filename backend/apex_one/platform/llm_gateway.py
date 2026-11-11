@@ -12,37 +12,58 @@ Supports:
 
 from __future__ import annotations
 
-import ipaddress
 import json
-import math
 import os
 import re
-import ssl
 import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
 
 import httpx
 
 from apex_one.db.models import DEFAULT_EMBEDDING_DIM as EMBEDDING_DIM
-from apex_one.integrations_hub import SSRFBlockedError, assert_public_http_url
+from apex_one.integrations_hub import SSRFBlockedError
+from apex_one.platform.cost_attribution import (
+    PRICING_CATALOG_VERSION,
+    CostCategory,
+    CostStatus,
+    compute_call_cost_quote,
+)
 from apex_one.platform.lan_llm_bridge import LanLLMBridgeBroker
 from apex_one.platform.local_intelligence import redact_confidential_text
-from apex_one.platform.memory_and_docs import embed_text_1536
+from apex_one.platform.memory_and_docs import (
+    EmbeddingDimensionMismatchError,
+    EmbeddingSpaceMetadata,
+    EmbeddingSpaceMismatchError,
+    build_local_deterministic_space,
+    embed_text_1536,
+    validate_and_l2_normalize_vector,
+)
+from apex_one.platform.ssrf_guard import (
+    DNSResolverFn,
+    EndpointTrustClass,
+    execute_ssrf_guarded_request,
+    normalize_origin,
+    resolve_and_validate_url,
+)
 
 
-def _validate_llm_endpoint(url: str) -> str:
-    """Validate LLM endpoint URL while always blocking cloud link-local metadata IPs."""
-    parts = urlsplit(url.strip())
-    if parts.hostname:
-        try:
-            ip = ipaddress.ip_address(parts.hostname)
-            if ip.is_link_local:
-                raise SSRFBlockedError(f"Metadata link-local IP '{ip}' is blocked.")
-        except ValueError:
-            pass
-    return assert_public_http_url(url, allow_local=True)
+def classify_provider_trust_class(provider_cfg: dict[str, Any]) -> EndpointTrustClass:
+    """Classify a model provider configuration into PUBLIC_PROVIDER vs CONTROLLED_LOCAL_MODEL."""
+    slug = str(provider_cfg.get("slug") or "").lower()
+    cat = str(provider_cfg.get("category") or "").lower()
+    if cat in {"cloud", "commercial_cloud"} or slug.startswith(
+        ("openai", "anthropic", "openrouter")
+    ):
+        return EndpointTrustClass.PUBLIC_PROVIDER
+    if (
+        cat in {"local", "local_ollama"}
+        or slug in {"ollama", "ollama-local", "lmstudio-lan-qwen"}
+        or slug.startswith(("ollama", "lmstudio"))
+        or (cat == "compatible_http" and provider_cfg.get("auth_env_var") is None)
+    ):
+        return EndpointTrustClass.CONTROLLED_LOCAL_MODEL
+    return EndpointTrustClass.PUBLIC_PROVIDER
 
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
@@ -68,6 +89,13 @@ class LLMCompletionResult:
     live_llm_invoked: bool
     fallback_triggered: bool
     error_note: str | None = None
+    cached_tokens: int = 0
+    actual_cost_usd: float | None = None
+    estimated_cost_usd: float | None = 0.0
+    pricing_version: str = PRICING_CATALOG_VERSION
+    cost_status: str = CostStatus.LOCAL_ZERO_API_COST.value
+    cost_category: str = CostCategory.LOCAL_COMPUTE.value
+    request_id: str | None = None
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -90,36 +118,11 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
-def _estimate_cost_usd(
-    provider_cfg: dict[str, Any],
-    model_identifier: str,
-    prompt_tokens: int,
-    completion_tokens: int,
-) -> float:
-    in_rate = 0.0005  # default per 1k tokens
-    out_rate = 0.0015
-    for m in provider_cfg.get("models") or []:
-        if m.get("id") == model_identifier:
-            in_rate = float(m.get("cost_per_1k_input_usd", in_rate))
-            out_rate = float(m.get("cost_per_1k_output_usd", out_rate))
-            break
-    return round((prompt_tokens / 1000.0) * in_rate + (completion_tokens / 1000.0) * out_rate, 6)
-
-
 def _normalize_to_1536(raw_vec: list[float]) -> list[float]:
-    if not raw_vec:
-        return [0.0] * EMBEDDING_DIM
-    if len(raw_vec) == EMBEDDING_DIM:
-        vec = [float(x) for x in raw_vec]
-    elif len(raw_vec) > EMBEDDING_DIM:
-        vec = [float(x) for x in raw_vec[:EMBEDDING_DIM]]
-    else:
-        # Deterministic tiled projection to 1536-d preserving cosine geometry
-        vec = [float(raw_vec[i % len(raw_vec)]) for i in range(EMBEDDING_DIM)]
-    norm = math.sqrt(sum(v * v for v in vec))
-    if norm > 1e-9:
-        vec = [round(v / norm, 6) for v in vec]
-    return vec
+    """Validate exact 1536-d vector and L2-normalize (padding/truncation strictly forbidden)."""
+    return validate_and_l2_normalize_vector(
+        raw_vec, expected_dimensions=EMBEDDING_DIM
+    )
 
 
 class LLMGateway:
@@ -130,13 +133,43 @@ class LLMGateway:
         *,
         http_timeout: float = 90.0,
         lan_bridge: LanLLMBridgeBroker | None = None,
+        dns_resolver: DNSResolverFn | None = None,
+        custom_transport_factory: Any = None,
+        max_response_bytes: int = 4 * 1024 * 1024,
     ) -> None:
         self._timeout = http_timeout
         self.lan_bridge = lan_bridge or LanLLMBridgeBroker()
+        self._dns_resolver = dns_resolver
+        self._custom_transport_factory = custom_transport_factory
+        self._max_response_bytes = max_response_bytes
         # Keyed by (organization_id, provider_slug) -> secret string (never serialized)
         self._runtime_secrets: dict[tuple[str, str], str] = {}
+        # Tenant-isolated owner-trusted local origins: organization_id -> set[origin]
+        self._owner_trusted_origins: dict[str, set[str]] = {}
         # Short-lived circuit breaker for unreachable private LAN hosts
         self._unreachable_until: dict[str, float] = {}
+
+    def trust_local_origin(self, *, organization_id: str, url_or_origin: str) -> str:
+        """Register an owner-authorized local model origin scoped strictly to `organization_id`."""
+        origin = normalize_origin(url_or_origin)
+        # Validate IP safety (always blocks cloud metadata, link-local, multicast, unspecified)
+        resolve_and_validate_url(
+            url_or_origin,
+            trust_class=EndpointTrustClass.CONTROLLED_LOCAL_MODEL,
+            owner_trusted_origins={origin},
+            dns_resolver=self._dns_resolver,
+        )
+        self._owner_trusted_origins.setdefault(organization_id, set()).add(origin)
+        return origin
+
+    def get_owner_trusted_origins(self, organization_id: str) -> set[str]:
+        trusted = set(self._owner_trusted_origins.get(organization_id, set()))
+        # Host-owner process env vars for local Ollama daemon (still subject to metadata/bogon checks)
+        for env_key in ("APEX_OLLAMA_URL", "OLLAMA_BASE_URL"):
+            env_val = os.environ.get(env_key, "").strip()
+            if env_val:
+                trusted.add(normalize_origin(env_val))
+        return trusted
 
     def set_runtime_secret(
         self,
@@ -292,6 +325,8 @@ class LLMGateway:
                 )
                 self._unreachable_until.pop(slug, None)
                 return res
+            except SSRFBlockedError:
+                raise
             except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                 self._unreachable_until[slug] = time.monotonic() + 30.0
                 last_err = f"{slug}: {type(exc).__name__}: {exc}"
@@ -358,21 +393,44 @@ class LLMGateway:
             lat_ms = int(
                 br.get("latency_ms") or max(1, int((time.perf_counter() - t0) * 1000))
             )
+            resolved_mod = str(br.get("model") or model_identifier)
+            quote = compute_call_cost_quote(
+                provider=slug,
+                model=resolved_mod,
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                cached_tokens=int(br.get("cached_tokens") or 0),
+                llm_invoked=True,
+                provider_cfg=provider_cfg,
+                explicit_category=CostCategory.LOCAL_LLM_API,
+            )
             return LLMCompletionResult(
                 content=content,
                 structured_json=_extract_json_object(content),
                 provider_slug=slug,
-                model_identifier=str(br.get("model") or model_identifier),
+                model_identifier=resolved_mod,
                 prompt_tokens=in_tok,
                 completion_tokens=out_tok,
                 total_tokens=tot_tok,
-                cost_usd=_estimate_cost_usd(
-                    provider_cfg, model_identifier, in_tok, out_tok
-                ),
+                cost_usd=0.0,
                 latency_ms=lat_ms,
                 live_llm_invoked=True,
                 fallback_triggered=fallback_triggered,
+                cached_tokens=int(br.get("cached_tokens") or 0),
+                actual_cost_usd=quote.actual_cost_usd,
+                estimated_cost_usd=quote.estimated_cost_usd,
+                pricing_version=quote.pricing_version,
+                cost_status=quote.cost_status,
+                cost_category=quote.cost_category,
+                request_id=str(br.get("request_id") or f"bridge_{int(t0 * 1000)}"),
             )
+
+        trust_class = classify_provider_trust_class(provider_cfg)
+        allow_dev_loopback = bool(provider_cfg.get("allow_dev_loopback", False))
+        trusted_local = self.get_owner_trusted_origins(organization_id)
+        cached_tok = 0
+        upstream_actual_cost: float | None = None
+        req_id: str | None = None
 
         if slug.startswith("anthropic"):
             if not api_key:
@@ -383,32 +441,44 @@ class LLMGateway:
                 if ant_root.endswith("/v1")
                 else f"{ant_root}/v1/messages"
             )
-            _validate_llm_endpoint(endpoint)
-            with httpx.Client(timeout=self._timeout, verify=ssl.create_default_context()) as client:
-                resp = client.post(
-                    endpoint,
-                    headers={
-                        "x-api-key": api_key,
-                        "anthropic-version": "2023-06-01",
-                        "content-type": "application/json",
-                    },
-                    json={
-                        "model": model_identifier,
-                        "max_tokens": max_tokens,
-                        "temperature": temperature,
-                        "system": system_prompt,
-                        "messages": [{"role": "user", "content": user_prompt}],
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            guarded = execute_ssrf_guarded_request(
+                "POST",
+                endpoint,
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json_body={
+                    "model": model_identifier,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "system": system_prompt,
+                    "messages": [{"role": "user", "content": user_prompt}],
+                },
+                trust_class=EndpointTrustClass.PUBLIC_PROVIDER,
+                allow_dev_loopback=allow_dev_loopback,
+                dns_resolver=self._dns_resolver,
+                connect_timeout=3.0,
+                read_timeout=max(30.0, self._timeout),
+                max_response_bytes=self._max_response_bytes,
+                custom_transport_factory=self._custom_transport_factory,
+            )
+            data = guarded.json()
             blocks = data.get("content") or []
             text_out = "\n".join(
                 b.get("text", "") for b in blocks if b.get("type") == "text"
             ).strip()
             usage = data.get("usage") or {}
-            p_tok = int(usage.get("input_tokens") or 0)
+            cached_tok = int(usage.get("cache_read_input_tokens") or 0)
+            p_tok = int(usage.get("input_tokens") or 0) + cached_tok
             c_tok = int(usage.get("output_tokens") or 0)
+            req_id = str(
+                data.get("id")
+                or guarded.headers.get("request-id")
+                or guarded.headers.get("x-request-id")
+                or ""
+            ) or None
         elif cat in {"local", "local_ollama"} or slug.startswith("ollama"):
             ollama_root = (
                 os.environ.get("APEX_OLLAMA_URL")
@@ -417,24 +487,31 @@ class LLMGateway:
                 or "http://127.0.0.1:11434"
             ).rstrip("/")
             endpoint = f"{ollama_root}/api/chat"
-            with httpx.Client(timeout=self._timeout) as client:
-                resp = client.post(
-                    endpoint,
-                    json={
-                        "model": model_identifier,
-                        "stream": False,
-                        "options": {"temperature": temperature},
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            guarded = execute_ssrf_guarded_request(
+                "POST",
+                endpoint,
+                json_body={
+                    "model": model_identifier,
+                    "stream": False,
+                    "options": {"temperature": temperature},
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                },
+                trust_class=EndpointTrustClass.CONTROLLED_LOCAL_MODEL,
+                owner_trusted_origins=trusted_local,
+                dns_resolver=self._dns_resolver,
+                connect_timeout=3.0,
+                read_timeout=max(30.0, self._timeout),
+                max_response_bytes=self._max_response_bytes,
+                custom_transport_factory=self._custom_transport_factory,
+            )
+            data = guarded.json()
             text_out = str((data.get("message") or {}).get("content") or "").strip()
             p_tok = int(data.get("prompt_eval_count") or max(1, len(user_prompt) // 4))
             c_tok = int(data.get("eval_count") or max(1, len(text_out) // 4))
+            req_id = guarded.headers.get("x-request-id") or None
         else:
             # OpenAI / OpenRouter / LM Studio / vLLM / Compatible HTTP (`/v1/chat/completions`)
             if not api_key and cat in {"cloud", "commercial_cloud"}:
@@ -445,34 +522,33 @@ class LLMGateway:
                 if root.endswith("/v1")
                 else f"{root}/v1/chat/completions"
             )
-            _validate_llm_endpoint(endpoint)
-            headers = {"Content-Type": "application/json"}
-            headers["Authorization"] = f"Bearer {api_key or 'lm-studio'}"
-            client_timeout = httpx.Timeout(
-                connect=2.5,
-                read=max(60.0, self._timeout),
-                write=15.0,
-                pool=5.0,
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key or 'lm-studio'}",
+            }
+            guarded = execute_ssrf_guarded_request(
+                "POST",
+                endpoint,
+                headers=headers,
+                json_body={
+                    "model": model_identifier,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                },
+                trust_class=trust_class,
+                allow_dev_loopback=allow_dev_loopback,
+                owner_trusted_origins=trusted_local if trust_class == EndpointTrustClass.CONTROLLED_LOCAL_MODEL else None,
+                dns_resolver=self._dns_resolver,
+                connect_timeout=2.5,
+                read_timeout=max(60.0, self._timeout),
+                max_response_bytes=self._max_response_bytes,
+                custom_transport_factory=self._custom_transport_factory,
             )
-            with httpx.Client(
-                timeout=client_timeout,
-                verify=ssl.create_default_context(),
-            ) as client:
-                resp = client.post(
-                    endpoint,
-                    headers=headers,
-                    json={
-                        "model": model_identifier,
-                        "temperature": temperature,
-                        "max_tokens": max_tokens,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            data = guarded.json()
             choices = data.get("choices") or []
             msg_obj = (choices[0].get("message") or {}) if choices else {}
             raw_content = str(msg_obj.get("content") or "").strip()
@@ -481,10 +557,39 @@ class LLMGateway:
             usage = data.get("usage") or {}
             p_tok = int(usage.get("prompt_tokens") or max(1, len(user_prompt) // 4))
             c_tok = int(usage.get("completion_tokens") or max(1, len(text_out) // 4))
+            p_details = usage.get("prompt_tokens_details") or {}
+            cached_tok = int(
+                p_details.get("cached_tokens")
+                or usage.get("cached_tokens")
+                or 0
+            )
+            if usage.get("cost") is not None:
+                upstream_actual_cost = float(usage["cost"])
+            elif guarded.headers.get("x-billing-cost-usd") is not None:
+                upstream_actual_cost = float(guarded.headers["x-billing-cost-usd"])
+            req_id = str(
+                data.get("id")
+                or guarded.headers.get("x-request-id")
+                or ""
+            ) or None
 
         elapsed_ms = max(1, int((time.perf_counter() - t0) * 1000))
         tot_tok = p_tok + c_tok
-        cost = _estimate_cost_usd(provider_cfg, model_identifier, p_tok, c_tok)
+        quote = compute_call_cost_quote(
+            provider=slug,
+            model=model_identifier,
+            input_tokens=p_tok,
+            output_tokens=c_tok,
+            cached_tokens=cached_tok,
+            llm_invoked=True,
+            provider_cfg=provider_cfg,
+            upstream_actual_cost_usd=upstream_actual_cost,
+        )
+        effective_usd = float(
+            quote.actual_cost_usd
+            if quote.actual_cost_usd is not None
+            else (quote.estimated_cost_usd or 0.0)
+        )
         return LLMCompletionResult(
             content=text_out,
             structured_json=_extract_json_object(text_out),
@@ -493,10 +598,161 @@ class LLMGateway:
             prompt_tokens=p_tok,
             completion_tokens=c_tok,
             total_tokens=tot_tok,
-            cost_usd=cost,
+            cost_usd=effective_usd,
             latency_ms=elapsed_ms,
             live_llm_invoked=True,
             fallback_triggered=fallback_triggered,
+            cached_tokens=cached_tok,
+            actual_cost_usd=quote.actual_cost_usd,
+            estimated_cost_usd=quote.estimated_cost_usd,
+            pricing_version=quote.pricing_version,
+            cost_status=quote.cost_status,
+            cost_category=quote.cost_category,
+            request_id=req_id,
+        )
+
+    def embed_with_space_contract(
+        self,
+        text: str,
+        *,
+        organization_id: str,
+        providers_catalog: list[dict[str, Any]],
+        target_space: EmbeddingSpaceMetadata | None = None,
+    ) -> tuple[list[float], EmbeddingSpaceMetadata]:
+        """Generate an embedding strictly honoring `target_space` without silent provider/hash fallback."""
+        space = target_space or build_local_deterministic_space(dimensions=EMBEDDING_DIM)
+        prov_name = space.embedding_provider.strip().lower()
+
+        if prov_name == "local-deterministic":
+            vec = embed_text_1536(text, dim=space.embedding_dimensions)
+            return validate_and_l2_normalize_vector(
+                vec, expected_dimensions=space.embedding_dimensions
+            ), space
+
+        if prov_name == "openai":
+            prov = next(
+                (
+                    p
+                    for p in providers_catalog
+                    if p.get("enabled", True)
+                    and str(p.get("slug") or "") in {"openai", "openai-compatible-cloud"}
+                ),
+                None,
+            )
+            if prov is None:
+                raise EmbeddingSpaceMismatchError(
+                    f"Active embedding space '{space.space_id}' requires OpenAI provider configuration; "
+                    "refusing to substitute incompatible local feature-hashing vectors."
+                )
+            api_key = self.resolve_api_key(
+                organization_id=organization_id, provider_cfg=prov
+            )
+            if not api_key:
+                raise EmbeddingSpaceMismatchError(
+                    f"Active embedding space '{space.space_id}' requires OPENAI_API_KEY; "
+                    "refusing to silently mix local feature-hashing vectors."
+                )
+            base = str(prov.get("base_url") or "https://api.openai.com/v1").rstrip("/")
+            url = (
+                f"{base}/embeddings"
+                if base.endswith("/v1")
+                else f"{base}/v1/embeddings"
+            )
+            safe_input = redact_confidential_text(text[:8000], for_external_cloud=True)
+            try:
+                guarded = execute_ssrf_guarded_request(
+                    "POST",
+                    url,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json_body={
+                        "model": space.embedding_model,
+                        "input": safe_input,
+                        "dimensions": space.embedding_dimensions,
+                    },
+                    trust_class=EndpointTrustClass.PUBLIC_PROVIDER,
+                    allow_dev_loopback=bool(prov.get("allow_dev_loopback", False)),
+                    dns_resolver=self._dns_resolver,
+                    connect_timeout=3.0,
+                    read_timeout=12.0,
+                    max_response_bytes=self._max_response_bytes,
+                    custom_transport_factory=self._custom_transport_factory,
+                )
+            except SSRFBlockedError:
+                raise
+            except Exception as exc:
+                raise EmbeddingSpaceMismatchError(
+                    f"Embedding provider '{space.space_id}' failed ({type(exc).__name__}: {exc}); "
+                    "refusing to silently fall back to incompatible local hash vectors."
+                ) from exc
+            emb = (guarded.json().get("data") or [{}])[0].get("embedding")
+            if not isinstance(emb, list) or not emb:
+                raise EmbeddingSpaceMismatchError(
+                    f"OpenAI embedding response missing vector for space '{space.space_id}'."
+                )
+            return (
+                validate_and_l2_normalize_vector(
+                    emb, expected_dimensions=space.embedding_dimensions
+                ),
+                space,
+            )
+
+        if prov_name == "ollama":
+            prov = next(
+                (
+                    p
+                    for p in providers_catalog
+                    if p.get("enabled", True)
+                    and str(p.get("slug") or "").startswith("ollama")
+                ),
+                None,
+            )
+            ollama_root = (
+                os.environ.get("APEX_OLLAMA_URL")
+                or os.environ.get("OLLAMA_BASE_URL")
+                or (str(prov.get("base_url") or "") if prov else "")
+            ).rstrip("/")
+            if not ollama_root:
+                raise EmbeddingSpaceMismatchError(
+                    f"Active embedding space '{space.space_id}' requires Ollama base URL; "
+                    "refusing to silently fall back to local hash vectors."
+                )
+            try:
+                guarded = execute_ssrf_guarded_request(
+                    "POST",
+                    f"{ollama_root}/api/embed",
+                    json_body={
+                        "model": space.embedding_model,
+                        "input": text[:8000],
+                    },
+                    trust_class=EndpointTrustClass.CONTROLLED_LOCAL_MODEL,
+                    owner_trusted_origins=self.get_owner_trusted_origins(organization_id),
+                    dns_resolver=self._dns_resolver,
+                    connect_timeout=2.5,
+                    read_timeout=8.0,
+                    max_response_bytes=self._max_response_bytes,
+                    custom_transport_factory=self._custom_transport_factory,
+                )
+            except SSRFBlockedError:
+                raise
+            except Exception as exc:
+                raise EmbeddingSpaceMismatchError(
+                    f"Ollama embedding provider '{space.space_id}' failed ({type(exc).__name__}: {exc}); "
+                    "refusing to silently fall back to local hash vectors."
+                ) from exc
+            embs = guarded.json().get("embeddings") or []
+            if not embs or not isinstance(embs[0], list):
+                raise EmbeddingSpaceMismatchError(
+                    f"Ollama embedding response missing vector for space '{space.space_id}'."
+                )
+            return (
+                validate_and_l2_normalize_vector(
+                    embs[0], expected_dimensions=space.embedding_dimensions
+                ),
+                space,
+            )
+
+        raise EmbeddingSpaceMismatchError(
+            f"Unsupported embedding_provider='{space.embedding_provider}' in space '{space.space_id}'."
         )
 
     def embed_text_1536_with_live_provider(
@@ -507,7 +763,7 @@ class LLMGateway:
         providers_catalog: list[dict[str, Any]],
         allow_external_cloud: bool = True,
     ) -> tuple[list[float], str]:
-        """Generate a 1536-d semantic vector locally by default or via configured provider."""
+        """Generate a 1536-d vector, raising `EmbeddingDimensionMismatchError` if upstream returns non-1536d."""
         for prov in providers_catalog:
             if not prov.get("enabled", True):
                 continue
@@ -524,22 +780,29 @@ class LLMGateway:
                         else f"{base}/v1/embeddings"
                     )
                     try:
-                        _validate_llm_endpoint(url)
                         safe_input = redact_confidential_text(text[:8000], for_external_cloud=True)
-                        with httpx.Client(timeout=12.0, verify=ssl.create_default_context()) as client:
-                            r = client.post(
-                                url,
-                                headers={"Authorization": f"Bearer {api_key}"},
-                                json={
-                                    "model": "text-embedding-3-small",
-                                    "input": safe_input,
-                                    "dimensions": EMBEDDING_DIM,
-                                },
-                            )
-                            r.raise_for_status()
-                            emb = (r.json().get("data") or [{}])[0].get("embedding")
-                            if isinstance(emb, list) and emb:
-                                return _normalize_to_1536(emb), "openai:text-embedding-3-small"
+                        guarded = execute_ssrf_guarded_request(
+                            "POST",
+                            url,
+                            headers={"Authorization": f"Bearer {api_key}"},
+                            json_body={
+                                "model": "text-embedding-3-small",
+                                "input": safe_input,
+                                "dimensions": EMBEDDING_DIM,
+                            },
+                            trust_class=EndpointTrustClass.PUBLIC_PROVIDER,
+                            allow_dev_loopback=bool(prov.get("allow_dev_loopback", False)),
+                            dns_resolver=self._dns_resolver,
+                            connect_timeout=3.0,
+                            read_timeout=12.0,
+                            max_response_bytes=self._max_response_bytes,
+                            custom_transport_factory=self._custom_transport_factory,
+                        )
+                        emb = (guarded.json().get("data") or [{}])[0].get("embedding")
+                        if isinstance(emb, list) and emb:
+                            return _normalize_to_1536(emb), "openai:text-embedding-3-small"
+                    except (SSRFBlockedError, EmbeddingDimensionMismatchError):
+                        raise
                     except Exception:
                         pass
             elif slug.startswith("ollama") and (
@@ -550,18 +813,26 @@ class LLMGateway:
                     or os.environ["OLLAMA_BASE_URL"]
                 ).rstrip("/")
                 try:
-                    with httpx.Client(timeout=8.0) as client:
-                        r = client.post(
-                            f"{ollama_root}/api/embed",
-                            json={
-                                "model": os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text"),
-                                "input": text[:8000],
-                            },
-                        )
-                        r.raise_for_status()
-                        embs = r.json().get("embeddings") or []
-                        if embs and isinstance(embs[0], list):
-                            return _normalize_to_1536(embs[0]), "ollama:nomic-embed-text"
+                    guarded = execute_ssrf_guarded_request(
+                        "POST",
+                        f"{ollama_root}/api/embed",
+                        json_body={
+                            "model": os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text"),
+                            "input": text[:8000],
+                        },
+                        trust_class=EndpointTrustClass.CONTROLLED_LOCAL_MODEL,
+                        owner_trusted_origins=self.get_owner_trusted_origins(organization_id),
+                        dns_resolver=self._dns_resolver,
+                        connect_timeout=2.5,
+                        read_timeout=8.0,
+                        max_response_bytes=self._max_response_bytes,
+                        custom_transport_factory=self._custom_transport_factory,
+                    )
+                    embs = guarded.json().get("embeddings") or []
+                    if embs and isinstance(embs[0], list):
+                        return _normalize_to_1536(embs[0]), "ollama:nomic-embed-text"
+                except (SSRFBlockedError, EmbeddingDimensionMismatchError):
+                    raise
                 except Exception:
                     pass
 
