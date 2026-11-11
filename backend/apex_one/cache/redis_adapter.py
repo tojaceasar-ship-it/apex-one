@@ -24,6 +24,25 @@ class CacheHealthReport:
     error: str | None = None
 
 
+_SLIDING_WINDOW_LUA = """
+local key = KEYS[1]
+local cutoff = tonumber(ARGV[1])
+local now_ms = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local window_ms = tonumber(ARGV[4])
+local member = ARGV[5]
+
+redis.call('ZREMRANGEBYSCORE', key, '-inf', cutoff)
+local count = redis.call('ZCARD', key)
+if count >= limit then
+    return {0, 0}
+end
+redis.call('ZADD', key, now_ms, member)
+redis.call('PEXPIRE', key, window_ms)
+return {1, math.max(0, limit - (count + 1))}
+"""
+
+
 class CacheAdapter(Protocol):
     @property
     def is_enabled(self) -> bool: ...
@@ -35,6 +54,16 @@ class CacheAdapter(Protocol):
     async def delete(self, key: str) -> bool: ...
 
     async def publish(self, channel: str, message: str) -> int: ...
+
+    async def check_sliding_window(
+        self,
+        key: str,
+        *,
+        limit: int,
+        window_seconds: int,
+        now_ms: int,
+        member_id: str,
+    ) -> tuple[bool, int]: ...
 
     async def health_check(self) -> CacheHealthReport: ...
 
@@ -59,6 +88,17 @@ class DisabledCacheAdapter:
 
     async def publish(self, channel: str, message: str) -> int:
         return 0
+
+    async def check_sliding_window(
+        self,
+        key: str,
+        *,
+        limit: int,
+        window_seconds: int,
+        now_ms: int,
+        member_id: str,
+    ) -> tuple[bool, int]:
+        raise RuntimeError("Redis rate-limit backend is not enabled.")
 
     async def health_check(self) -> CacheHealthReport:
         return CacheHealthReport(
@@ -115,6 +155,32 @@ class RedisCacheAdapter:
         client = self._get_client()
         count = await client.publish(channel, message)
         return int(count)
+
+    async def check_sliding_window(
+        self,
+        key: str,
+        *,
+        limit: int,
+        window_seconds: int,
+        now_ms: int,
+        member_id: str,
+    ) -> tuple[bool, int]:
+        client = self._get_client()
+        window_ms = max(1000, int(window_seconds * 1000))
+        cutoff = now_ms - window_ms
+        res = await client.eval(  # type: ignore[misc]
+            _SLIDING_WINDOW_LUA,
+            1,
+            f"apex:rl:{key}",
+            str(cutoff),
+            str(now_ms),
+            str(limit),
+            str(window_ms),
+            member_id,
+        )
+        allowed = bool(int(res[0]))
+        remaining = int(res[1])
+        return allowed, remaining
 
     async def health_check(self) -> CacheHealthReport:
         try:

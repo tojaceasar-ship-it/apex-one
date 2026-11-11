@@ -18,8 +18,8 @@ from apex_one.db.repositories import (
     WorkflowStoreProtocol,
 )
 from apex_one.local_node_gateway.protocol import (
-    DEFAULT_DEV_NODE_SECRET,
     LocalNodeGatewayRegistry,
+    validate_local_node_secret,
 )
 from apex_one.platform.async_runner import AsyncRunCoordinator
 from apex_one.platform.security import SlidingWindowRateLimiter
@@ -42,35 +42,64 @@ class AppContainer:
     rate_limiter: SlidingWindowRateLimiter
 
 
+def _resolve_demo_seed(cfg: Settings, seed_demo: bool | None) -> bool:
+    effective = cfg.enable_demo_seed if seed_demo is None else bool(seed_demo)
+    if effective and cfg.env not in {"development", "test"}:
+        raise ValueError(
+            f"Demo seeding is strictly forbidden in '{cfg.env}' environment; "
+            "only explicit 'development' or 'test' profiles may seed demo fixtures."
+        )
+    return effective
+
+
 def build_app_container(
     settings: Settings | None = None,
     *,
-    seed_demo: bool = True,
-    max_rpm: int = 600,
+    seed_demo: bool | None = None,
+    max_rpm: int | None = None,
+    auth_max_rpm: int | None = None,
+    expensive_max_rpm: int | None = None,
 ) -> AppContainer:
     cfg = settings or get_settings()
+    effective_seed_demo = _resolve_demo_seed(cfg, seed_demo)
     db_adapter = PostgresConnectionAdapter(cfg)
-    node_secret = (
+    cache_adapter = build_cache_adapter(cfg)
+    raw_node_secret = (
         cfg.local_node_shared_secret.get_secret_value()
-        if cfg.local_node_shared_secret
-        else DEFAULT_DEV_NODE_SECRET
+        if cfg.local_node_shared_secret is not None
+        else None
+    )
+    node_secret = validate_local_node_secret(raw_node_secret, env=cfg.env)
+    effective_rpm = cfg.rate_limit_rpm if max_rpm is None else max_rpm
+    effective_auth_rpm = (
+        cfg.rate_limit_auth_rpm if auth_max_rpm is None else auth_max_rpm
+    )
+    effective_expensive_rpm = (
+        cfg.rate_limit_expensive_rpm
+        if expensive_max_rpm is None
+        else expensive_max_rpm
     )
     return AppContainer(
         settings=cfg,
         db_adapter=db_adapter,
         workflow_store=SqlAlchemyWorkflowStore(db_adapter),
         vector_store=SqlAlchemyKnowledgeVectorStore(db_adapter),
-        cache_adapter=build_cache_adapter(cfg),
+        cache_adapter=cache_adapter,
         sandbox_adapter=build_sandbox_adapter(cfg),
         local_node_registry=LocalNodeGatewayRegistry(
             shared_secret=node_secret,
+            env=cfg.env,
             arena_isolated_mode=cfg.arena_isolated_mode,
         ),
-        platform=ApexPlatformService(seed_demo=seed_demo),
+        platform=ApexPlatformService(seed_demo=effective_seed_demo, env=cfg.env),
         platform_persistence=PostgresPlatformPersistence(db_adapter),
         async_runner=AsyncRunCoordinator(),
         rate_limiter=SlidingWindowRateLimiter(
-            max_requests=max_rpm, window_seconds=60
+            max_requests=effective_rpm,
+            window_seconds=60,
+            auth_max_requests=effective_auth_rpm,
+            expensive_max_requests=effective_expensive_rpm,
+            cache_adapter=cache_adapter,
         ),
     )
 
