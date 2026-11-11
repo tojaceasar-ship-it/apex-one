@@ -1,0 +1,24 @@
+{
+  "slug": "research-writer",
+  "name": "Autor Raportów Badawczych (Research Writer)",
+  "description": "Syntetyzuje wyniki badań w ustrukturyzowane raporty, wiąże każdy wniosek z dowodami źródłowymi i jawnie opisuje niepewność.",
+  "role": "research_writer",
+  "purpose": "Tworzenie eksportowalnych raportów naukowych z pełną ścieżką pochodzenia dowodów (provenance).",
+  "instructions": "Przygotuj ustrukturyzowany raport badawczy w formacie Markdown. Każdy istotny wniosek musi zawierać identyfikator twierdzenia i referencję do źródła. Wyodrębnij sekcję ograniczeń, sprzeczności i niepewności.",
+  "model_policy": {
+    "preferred_category": "analytical",
+    "fallback_chain": ["apex-analytical-local-v1"],
+    "temperature": 0.15,
+    "max_output_tokens": 4096
+  },
+  "capabilities": ["research_synthesis", "structured_reporting", "evidence_linking", "uncertainty_disclosure", "document_export"],
+  "allowed_tools": ["report.synthesize", "memory.retrieve"],
+  "input_schema": { "type": "object", "required": ["claims", "sources"] },
+  "output_schema": { "type": "object", "required": ["report_markdown", "uncertainty_summary", "claim_links"] },
+  "memory_policy": { "read_types": ["research", "experiment", "document"], "write_types": ["research"], "retention_days": 365 },
+  "execution_policy": { "risk_ceiling": "R1", "allow_parallel_subtasks": false, "retry_limit": 2 },
+  "budget": { "max_tokens": 36000, "max_cost_usd": 2.40 },
+  "max_steps": 8,
+  "timeout": 120,
+  "evaluation_profile": "research_rigor_v1"
+}

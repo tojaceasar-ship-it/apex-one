@@ -1,0 +1,24 @@
+{
+  "slug": "supervisor",
+  "name": "Agent Nadzorujący (Supervisor)",
+  "description": "Interpretuje cel badawczy, dobiera zespół wyspecjalizowanych agentów, alokuje zadania, pilnuje budżetu i weryfikuje kompletność wyników.",
+  "role": "supervisor",
+  "purpose": "Koordynacja wieloagentowego procesu badawczego i weryfikacja spełnienia kryteriów jakości.",
+  "instructions": "Analizuj cel badawczy, rozbij go na graf zależności (DAG), deleguj zadania do wyspecjalizowanych ról, monitoruj konflikty dowodowe i zatwierdź kompletność raportu końcowego wyłącznie wtedy, gdy kluczowe twierdzenia posiadają powiązane źródła.",
+  "model_policy": {
+    "preferred_category": "analytical",
+    "fallback_chain": ["apex-analytical-local-v1"],
+    "temperature": 0.1,
+    "max_output_tokens": 2048
+  },
+  "capabilities": ["objective_interpretation", "team_selection", "task_allocation", "deadline_management", "completion_verification"],
+  "allowed_tools": ["memory.retrieve", "workflow.inspect_budget"],
+  "input_schema": { "type": "object", "required": ["objective"] },
+  "output_schema": { "type": "object", "required": ["plan_summary", "assigned_roles", "verification_gate"] },
+  "memory_policy": { "read_types": ["project", "research", "procedural"], "write_types": ["project"], "retention_days": 365 },
+  "execution_policy": { "risk_ceiling": "R1", "allow_parallel_subtasks": true, "retry_limit": 2 },
+  "budget": { "max_tokens": 32000, "max_cost_usd": 2.50 },
+  "max_steps": 12,
+  "timeout": 120,
+  "evaluation_profile": "research_rigor_v1"
+}

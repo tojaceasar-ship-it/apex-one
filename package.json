@@ -1,0 +1,33 @@
+{
+  "name": "apex-one-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "APEX ONE Research Edition — Web Console & TypeScript Agent Runtime",
+  "workspaces": [
+    "packages/agent-runtime",
+    "apps/web"
+  ],
+  "scripts": {
+    "build": "npm --workspace @apex-one/agent-runtime run build && npm --workspace @apex-one/web run build",
+    "typecheck": "npm --workspace @apex-one/agent-runtime run typecheck && npm --workspace @apex-one/web run typecheck",
+    "pretest": "npm --workspace @apex-one/agent-runtime run build",
+    "test": "vitest run",
+    "dev:web": "npm --workspace @apex-one/web run dev"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.16",
+    "@electric-sql/pglite-pgvector": "^0.0.17",
+    "@tailwindcss/vite": "^4.3.5",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.7.0",
+    "jsdom": "^31.0.0",
+    "tailwindcss": "^4.3.5",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.6",
+    "vitest": "^3.2.7"
+  }
+}

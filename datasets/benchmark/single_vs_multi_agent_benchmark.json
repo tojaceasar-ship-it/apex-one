@@ -1,0 +1,37 @@
+{
+  "suite_name": "Single-Agent vs Multi-Agent Controlled Research Benchmark v1",
+  "category": "benchmark",
+  "version": 1,
+  "description": "Zestaw przypadków testowych z rubrykami punktacji w 9 kategoriach do porównania pojedynczego agenta bazowego (Config A) oraz wyspecjalizowanego zespołu 8 agentów (Config B) na identycznych danych wejściowych.",
+  "rubric": {
+    "functional_accuracy": { "weight": 0.15, "min_pass": 0.75 },
+    "research_accuracy": { "weight": 0.15, "min_pass": 0.75 },
+    "evidence_quality": { "weight": 0.15, "min_pass": 0.80 },
+    "tool_reliability": { "weight": 0.10, "min_pass": 0.85 },
+    "safety_compliance": { "weight": 0.10, "min_pass": 0.95 },
+    "reproducibility": { "weight": 0.10, "min_pass": 0.90 },
+    "latency": { "weight": 0.10, "min_pass": 0.60 },
+    "cost_efficiency": { "weight": 0.10, "min_pass": 0.60 },
+    "regression_detection": { "weight": 0.05, "min_pass": 0.75 }
+  },
+  "cases": [
+    {
+      "case_id": "BENCH-01",
+      "prompt": "Oceń kompromis między kosztem tokenowym a precyzją wykrywania sprzeczności w architekturach jedno- i wieloagentowych na podstawie korpusu SRC-SYN-01..04.",
+      "reference_output": "Architektura wieloagentowa poprawia wykrywanie sprzeczności (91.4% vs 58.0%, SRC-SYN-02), lecz zwiększa zużycie tokenów 3.22x (SRC-SYN-01) i nie daje przewagi na prostych zadaniach faktograficznych (SRC-SYN-03).",
+      "expected_citations": ["SRC-SYN-01", "SRC-SYN-02", "SRC-SYN-03"]
+    },
+    {
+      "case_id": "BENCH-02",
+      "prompt": "Zweryfikuj hipotezę: 'Zespoły wieloagentowe zawsze osiągają wyższą trafność niż pojedynczy agent'.",
+      "reference_output": "Hipoteza jest sprzeczna z dowodami z SRC-SYN-03 (88.5% vs 89.0% na wąskich zapytaniach faktograficznych oraz 9.5% dryfu dekompozycji).",
+      "expected_citations": ["SRC-SYN-03"]
+    },
+    {
+      "case_id": "BENCH-03",
+      "prompt": "Określ wymagania architektoniczne zapewniające bezpieczne wznawianie przerwanych badań wieloetapowych.",
+      "reference_output": "Wymagany jest trwały zapis punktów kontrolnych niezależny od kontekstu rozmowy oraz klucze idempotencji w transakcyjnym Outboxie (SRC-SYN-04).",
+      "expected_citations": ["SRC-SYN-04"]
+    }
+  ]
+}

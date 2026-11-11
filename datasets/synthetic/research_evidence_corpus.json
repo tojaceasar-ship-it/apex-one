@@ -1,0 +1,68 @@
+{
+  "dataset_name": "Synthetic Research Architecture Evidence Corpus v1",
+  "category": "synthetic",
+  "version": 1,
+  "description": "Oznakowany syntetyczny korpus badawczy służący do weryfikacji ekstrakcji twierdzeń, wykrywania sprzeczności oraz porównania systemów jednoagentowych i wieloagentowych.",
+  "records": [
+    {
+      "doc_id": "SRC-SYN-01",
+      "title": "Empirical Latency & Token Scaling in Autonomous Research Architectures (2026)",
+      "source_type": "MD",
+      "published_at": "2026-04-12T00:00:00Z",
+      "authors": ["K. Nowak", "E. Lindqvist"],
+      "text": "Across 120 controlled literature-synthesis tasks, single-agent pipelines completed runs in a median of 420 ms per normalized analytical stage with mean consumption of 1,840 tokens. Multi-agent 8-role pipelines consumed a mean of 5,920 tokens (3.22x token overhead) due to inter-agent handoffs and critic verification passes.",
+      "labeled_claims": [
+        {
+          "statement": "Systemy wieloagentowe generują wyższy narzut tokenowy (ok. 3.22x) i czasowy niż pojedynczy uniwersalny agent ze względu na przekazywanie kontekstu i weryfikację krzyżową.",
+          "polarity": "supporting",
+          "topic": "efficiency_overhead"
+        }
+      ]
+    },
+    {
+      "doc_id": "SRC-SYN-02",
+      "title": "Contradiction Detection & Citation Precision Under Dedicated Critic Agents (2026)",
+      "source_type": "MD",
+      "published_at": "2026-06-19T00:00:00Z",
+      "authors": ["M. Kowalski", "S. Chen"],
+      "text": "When source corpora contained deliberate conflicting findings, specialized Evidence Analyst + Critic/Replicator pipelines identified 91.4% of cross-source contradictions and linked 96.0% of conclusions to primary spans. Single-agent baselines detected 58.0% of contradictions and exhibited 14.2% unattributed synthesis statements.",
+      "labeled_claims": [
+        {
+          "statement": "Dedykowane role Evidence Analyst oraz Critic/Replicator istotnie zwiększają wykrywalność sprzeczności między źródłami (91.4% vs 58.0% w bazie jednoagentowej).",
+          "polarity": "supporting",
+          "topic": "contradiction_recall"
+        }
+      ]
+    },
+    {
+      "doc_id": "SRC-SYN-03",
+      "title": "Failure Modes of Unbounded Multi-Agent Delegation on Narrow Factoid Queries (2026)",
+      "source_type": "MD",
+      "published_at": "2026-08-03T00:00:00Z",
+      "authors": ["R. Patel", "A. Zielińska"],
+      "text": "Contrary to universal superiority claims for multi-agent teams, on narrow single-source factoid tasks multi-agent coordination introduced cascading decomposition drift in 9.5% of runs without improving factual accuracy over a single well-prompted agent (88.5% vs 89.0%).",
+      "labeled_claims": [
+        {
+          "statement": "Zespoły wieloagentowe zawsze przewyższają pojedynczego agenta w każdym typie zadania badawczego niezależnie od złożoności.",
+          "polarity": "contradicting",
+          "topic": "universal_superiority_claim"
+        }
+      ]
+    },
+    {
+      "doc_id": "SRC-SYN-04",
+      "title": "Checkpoint Durability and Idempotent Tool Execution in Hybrid Research Workflows (2026)",
+      "source_type": "TXT",
+      "published_at": "2026-09-15T00:00:00Z",
+      "authors": ["D. Vermeulen"],
+      "text": "Persisting step-level checkpoints with idempotency keys in a transactional outbox enabled 100% recovery of interrupted multi-step research runs with zero duplicate external tool invocations across 500 simulated worker restarts.",
+      "labeled_claims": [
+        {
+          "statement": "Trwały zapis stanu kroków z kluczami idempotencji eliminuje duplikację wywołań narzędzi podczas wznawiania przerwanych przepływów badawczych.",
+          "polarity": "supporting",
+          "topic": "durable_recovery"
+        }
+      ]
+    }
+  ]
+}

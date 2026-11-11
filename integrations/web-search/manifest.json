@@ -1,0 +1,1 @@
+{"slug": "web-search", "env_vars": ["APEX_WEB_SEARCH_ENDPOINT", "APEX_WEB_SEARCH_API_KEY"], "fallback": "local-documents"}
