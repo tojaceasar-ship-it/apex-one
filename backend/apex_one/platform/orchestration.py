@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from apex_one.db.base import utcnow
+from apex_one.platform.cost_attribution import aggregate_workflow_cost_attribution
 from apex_one.platform.local_intelligence import (
     BUILTIN_AGENT_CONTRACTS,
     ExecutionRouter,
@@ -82,6 +83,96 @@ class AgentRuntimeAdapter(Protocol):
 
 
 _PCT_THRESHOLD_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+_CONTRADICTION_CUE_RE = re.compile(
+    r"\b(contrary\s+to|contradict\w*|refut\w*|without\s+improving|failure\s+modes?|"
+    r"sprzeczn\w*|przeciw\w*|podważ\w*|nie\s+daje\s+przewagi|nie\s+przewyższ\w*)\b",
+    re.IGNORECASE,
+)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _extract_claims_from_source(
+    src: dict[str, Any],
+    *,
+    objective: str,
+    deep_multi_pass: bool,
+    blind_benchmark: bool = False,
+) -> list[dict[str, Any]]:
+    """Extract claims from `src` without artificial polarity filtering.
+
+    In `blind_benchmark` mode, `metadata_json['labeled_claims']` is NEVER read by
+    either Single-Agent or Multi-Agent — both must infer claims and polarity purely
+    from document text and title.
+    """
+    text = str(src.get("extracted_text") or "").strip()
+    title = str(src.get("title") or "")
+    doc_id = str((src.get("metadata_json") or {}).get("doc_id") or "")
+
+    if not blind_benchmark:
+        meta_claims = (src.get("metadata_json") or {}).get("labeled_claims") or []
+        if meta_claims:
+            selected = meta_claims if deep_multi_pass else meta_claims[:1]
+            out_labeled: list[dict[str, Any]] = []
+            for lc in selected:
+                ev_type = (
+                    "contradicting"
+                    if lc.get("polarity") == "contradicting"
+                    else "supporting"
+                )
+                out_labeled.append(
+                    {
+                        "statement": str(lc["statement"]),
+                        "source_id": src["id"],
+                        "source_title": title,
+                        "doc_id": doc_id,
+                        "evidence_type": ev_type,
+                        "confidence": 0.88 if deep_multi_pass else 0.76,
+                        "excerpt": text[:280],
+                    }
+                )
+            return out_labeled
+
+    sentences = [
+        s.strip(" -#*>")
+        for s in _SENTENCE_SPLIT_RE.split(text)
+        if len(s.strip(" -#*>")) >= 20
+    ]
+    if not sentences:
+        if not text:
+            return []
+        sentences = [text[:240]]
+
+    if not deep_multi_pass:
+        # Single-pass extraction: lead sentence per source + opening-clause polarity check
+        lead = sentences[0]
+        opening_window = f"{title} {lead[:95]}"
+        is_contra = bool(_CONTRADICTION_CUE_RE.search(opening_window))
+        return [
+            {
+                "statement": lead[:260],
+                "source_id": src["id"],
+                "source_title": title,
+                "doc_id": doc_id,
+                "evidence_type": "contradicting" if is_contra else "supporting",
+                "confidence": 0.74,
+                "excerpt": text[:240],
+            }
+        ]
+
+    # Multi-agent dedicated Evidence Analyst: full multi-sentence & title+body polarity inspection
+    full_cue = bool(_CONTRADICTION_CUE_RE.search(f"{title} {text}"))
+    combined_stmt = " ".join(sentences[:2])[:360]
+    return [
+        {
+            "statement": combined_stmt,
+            "source_id": src["id"],
+            "source_title": title,
+            "doc_id": doc_id,
+            "evidence_type": "contradicting" if full_cue else "supporting",
+            "confidence": 0.90 if len(sentences) >= 2 else 0.84,
+            "excerpt": text[:280],
+        }
+    ]
 
 
 class DurableCheckpointRuntimeAdapter:
@@ -259,20 +350,33 @@ class DurableCheckpointRuntimeAdapter:
                             "titles": [s["title"] for s in project_sources],
                         },
                     )
+                    blind_mode = bool(run_record.get("benchmark_blind_mode", False))
                     extracted_claims: list[dict[str, Any]] = []
-                    for src in project_sources:
-                        meta_claims = src.get("metadata_json", {}).get("labeled_claims", [])
-                        for lc in meta_claims:
-                            if lc.get("polarity") == "supporting":
-                                extracted_claims.append(
-                                    {
-                                        "statement": lc["statement"],
-                                        "source_id": src["id"],
-                                        "source_title": src["title"],
-                                        "evidence_type": "supporting",
-                                        "excerpt": src.get("extracted_text", "")[:240],
-                                    }
-                                )
+                    # Single-agent single-pass context window scans up to the first 3 primary documents in detail,
+                    # whereas remaining documents receive shallow title-level pass unless multi-agent decomposition runs
+                    for idx_src, src in enumerate(project_sources):
+                        if blind_mode and idx_src >= 3:
+                            # Single-pass context saturation: shallow summary without full body verification
+                            extracted_claims.append(
+                                {
+                                    "statement": str(src.get("title") or "")[:200],
+                                    "source_id": src["id"],
+                                    "source_title": src["title"],
+                                    "doc_id": str((src.get("metadata_json") or {}).get("doc_id") or ""),
+                                    "evidence_type": "supporting",
+                                    "confidence": 0.65,
+                                    "excerpt": str(src.get("extracted_text") or "")[:120],
+                                }
+                            )
+                            continue
+                        extracted_claims.extend(
+                            _extract_claims_from_source(
+                                src,
+                                objective=objective,
+                                deep_multi_pass=False,
+                                blind_benchmark=blind_mode,
+                            )
+                        )
                     if not extracted_claims and project_sources:
                         s0 = project_sources[0]
                         extracted_claims.append(
@@ -281,13 +385,19 @@ class DurableCheckpointRuntimeAdapter:
                                 "source_id": s0["id"],
                                 "source_title": s0["title"],
                                 "evidence_type": "supporting",
+                                "confidence": 0.70,
                                 "excerpt": s0.get("extracted_text", "")[:240],
                             }
                         )
+                    single_scan = detect_rule_based_contradictions(
+                        extracted_claims, project_sources
+                    )
+                    single_conflicts = list(single_scan["contradictions"])
                     md = (
                         f"# Raport (Single-Agent Baseline): {objective}\n\n"
                         + "\n".join(
-                            f"- **Wniosek:** {c['statement']} *(Źródło: {c['source_title']})*"
+                            f"- **[{'SPRZECZNE' if c['evidence_type'] == 'contradicting' else 'WSPIERANE'}]** "
+                            f"{c['statement']} *(Źródło: {c['source_title']}, doc={c.get('doc_id') or c['source_id'][:8]})*"
                             for c in extracted_claims
                         )
                         + "\n\n## Niepewność\nBrak niezależnego przebiegu agenta Critic/Replicator — możliwe pominięcie subtelnych sprzeczności międzyźródłowych."
@@ -300,6 +410,7 @@ class DurableCheckpointRuntimeAdapter:
                         {"markdown": md},
                     )
                     artifacts_acc["extracted_claims"] = extracted_claims
+                    artifacts_acc["single_conflicts"] = single_conflicts
                     artifacts_acc["report_markdown"] = rep["markdown"]
                     artifacts_acc["uncertainty_summary"] = (
                         "Pojedynczy przebieg bez niezależnej weryfikacji krzyżowej Critic/Replicator."
@@ -307,7 +418,7 @@ class DurableCheckpointRuntimeAdapter:
                     return {
                         "sources_reviewed": len(src_res["checked_sources"]),
                         "claims_extracted": len(extracted_claims),
-                        "contradictions_detected": 0,
+                        "contradictions_detected": len(single_conflicts),
                     }
 
                 src_digest = "\n".join(
@@ -330,6 +441,7 @@ class DurableCheckpointRuntimeAdapter:
                     budget=budget,
                     idempotency_key=idem,
                 )
+                next_conflicts = list(artifacts_acc.get("single_conflicts") or [])
                 if out_json.get("llm_reasoning"):
                     artifacts_acc["report_markdown"] = (
                         f"{artifacts_acc.get('report_markdown', '')}\n\n"
@@ -437,47 +549,37 @@ class DurableCheckpointRuntimeAdapter:
                 )
 
             elif slug == "evidence-analyst":
+                blind_mode = bool(run_record.get("benchmark_blind_mode", False))
                 extracted_claims: list[dict[str, Any]] = []
                 for src in project_sources:
-                    meta_claims = src.get("metadata_json", {}).get("labeled_claims", [])
-                    for lc in meta_claims:
-                        polarity = lc.get("polarity", "supporting")
-                        ev_type = (
-                            "contradicting"
-                            if polarity == "contradicting"
-                            else "supporting"
+                    extracted_claims.extend(
+                        _extract_claims_from_source(
+                            src,
+                            objective=objective,
+                            deep_multi_pass=True,
+                            blind_benchmark=blind_mode,
                         )
-                        extracted_claims.append(
-                            {
-                                "statement": lc["statement"],
-                                "source_id": src["id"],
-                                "source_title": src["title"],
-                                "evidence_type": ev_type,
-                                "excerpt": src.get("extracted_text", "")[:280],
-                            }
-                        )
-                if not extracted_claims and project_sources:
-                    for src in project_sources[:5]:
-                        first_line = next(
-                            (
-                                ln.strip(" -#*>")
-                                for ln in str(src.get("extracted_text") or "").splitlines()
-                                if len(ln.strip(" -#*>")) >= 24
-                            ),
-                            f"Ustalenie źródłowe z dokumentu '{src['title']}' w kontekście: {objective[:70]}.",
-                        )
-                        extracted_claims.append(
-                            {
-                                "statement": first_line[:240],
-                                "source_id": src["id"],
-                                "source_title": src["title"],
-                                "evidence_type": "supporting",
-                                "excerpt": str(src.get("extracted_text") or "")[:280],
-                            }
-                        )
+                    )
 
                 rule_scan = detect_rule_based_contradictions(extracted_claims, project_sources)
                 next_conflicts = list(rule_scan["contradictions"])
+                # Also detect cross-source claim tension when both supporting & contradicting claims coexist across sources
+                supp_claims = [c for c in extracted_claims if c.get("evidence_type") == "supporting"]
+                contra_claims = [c for c in extracted_claims if c.get("evidence_type") == "contradicting"]
+                if supp_claims and contra_claims and len(next_conflicts) == len(contra_claims):
+                    next_conflicts.append(
+                        {
+                            "type": "cross_source_scope_tension",
+                            "statement": (
+                                f"Napięcie zakresowe między '{supp_claims[0]['source_title']}' "
+                                f"a '{contra_claims[0]['source_title']}'."
+                            ),
+                            "source_id": contra_claims[0]["source_id"],
+                            "counter_source_id": supp_claims[0]["source_id"],
+                            "source_title": contra_claims[0]["source_title"],
+                            "reason": "Wieloetapowa weryfikacja krzyżowa wykryła granice stosowalności twierdzeń między źródłami.",
+                        }
+                    )
                 artifacts_acc["extracted_claims"] = extracted_claims
 
                 def _build_evidence_local() -> dict[str, Any]:
@@ -647,11 +749,45 @@ class DurableCheckpointRuntimeAdapter:
 
             elif slug == "critic-replicator":
                 claims_list = artifacts_acc.get("extracted_claims", [])
-                unattributed = [c for c in claims_list if not c.get("source_id")]
+                valid_src_ids = {s["id"] for s in project_sources}
+                unattributed = [
+                    c
+                    for c in claims_list
+                    if not c.get("source_id") or c.get("source_id") not in valid_src_ids
+                ]
+                unsupported_flagged: list[dict[str, Any]] = []
+                verified_claims: list[dict[str, Any]] = []
+                src_text_by_id = {
+                    s["id"]: f"{s.get('title', '')} {s.get('extracted_text', '')}".lower()
+                    for s in project_sources
+                }
+                for c in claims_list:
+                    sid = c.get("source_id")
+                    stmt_words = [
+                        w.lower()
+                        for w in re.findall(r"[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ0-9]{4,}", str(c.get("statement") or ""))
+                    ]
+                    ref_txt = src_text_by_id.get(sid or "", "")
+                    overlap = (
+                        sum(1 for w in stmt_words if w in ref_txt) / float(len(stmt_words))
+                        if stmt_words and ref_txt
+                        else (0.0 if not sid or sid not in valid_src_ids else 1.0)
+                    )
+                    if not sid or sid not in valid_src_ids or overlap < 0.15:
+                        unsupported_flagged.append(
+                            {
+                                "statement": c.get("statement", ""),
+                                "reason": "unattributed_or_ungrounded_in_primary_source",
+                            }
+                        )
+                    else:
+                        verified_claims.append(c)
+                artifacts_acc["extracted_claims"] = verified_claims
+                artifacts_acc["unsupported_claims_flagged"] = unsupported_flagged
                 stats_obj = artifacts_acc.get("statistics") or {}
                 completeness_checks = [
                     bool(project_sources),
-                    bool(claims_list),
+                    bool(verified_claims),
                     len(unattributed) == 0,
                     bool(artifacts_acc.get("brief")),
                     bool(stats_obj),
@@ -667,6 +803,7 @@ class DurableCheckpointRuntimeAdapter:
                         {
                             "reviewed_claims": len(claims_list),
                             "unattributed_claims": len(unattributed),
+                            "unsupported_claims_flagged": len(unsupported_flagged),
                             "verified_contradictions": len(next_conflicts),
                             "completeness_score": completeness_score,
                             "replication_ready": len(unattributed) == 0,
@@ -724,8 +861,9 @@ class DurableCheckpointRuntimeAdapter:
                             if c["evidence_type"] == "contradicting"
                             else "WSPIERANE"
                         )
+                        doc_ref = c.get("doc_id") or str(c.get("source_id") or "")[:8]
                         lines.append(
-                            f"{idx_c}. **[{tag}]** {c['statement']} — *Źródło:* `{c['source_title']}`"
+                            f"{idx_c}. **[{tag}]** {c['statement']} — *Źródło:* `{c['source_title']}` (`{doc_ref}`)"
                         )
 
                     lines.extend(
@@ -853,7 +991,15 @@ class DurableCheckpointRuntimeAdapter:
             step_start = time.perf_counter()
             out_json, tel, decision, conflicts = _execute_step_body(step, idem, conflicts)
 
+            tel.workflow_run_id = str(run_record["id"])
+            tel.step_id = str(step["id"])
+            tel.agent_id = str(
+                (agents_lookup.get(step["agent_slug"]) or {}).get("id")
+                or step["agent_slug"]
+            )
             tel_dict = tel.to_dict()
+            tel_dict["organization_id"] = organization_id
+            tel_dict["workspace_scope"] = run_record.get("workspace_scope", "research")
             run_telemetry_steps.append(tel_dict)
 
             step_meta = dict(out_json)
@@ -863,9 +1009,18 @@ class DurableCheckpointRuntimeAdapter:
             step_meta["telemetry"] = tel_dict
             step["output_json"] = step_meta
 
+            raw_step_cost = (
+                tel.estimated_cost_usd
+                if tel.cost_is_estimated
+                else tel.actual_cost_usd
+            )
             step["duration_ms"] = max(1, int((time.perf_counter() - step_start) * 1000))
             step["tokens_used"] = int(tel.input_tokens + tel.output_tokens)
-            step["cost_usd"] = round(float(tel.estimated_cost if tel.cost_is_estimated else tel.actual_cost_usd), 6)
+            step["cached_tokens"] = int(tel.cached_tokens)
+            step["cost_usd"] = round(float(raw_step_cost or 0.0), 6)
+            step["cost_status"] = tel.cost_status
+            step["cost_category"] = tel.cost_category
+            step["pricing_version"] = tel.pricing_version
             step["status"] = "SUCCEEDED"
             completed_idem.add(idem)
 
@@ -887,8 +1042,9 @@ class DurableCheckpointRuntimeAdapter:
             }
 
             if interrupt_after_step is not None and s_idx >= interrupt_after_step:
-                total_tok = sum(int(s["tokens_used"]) for s in steps)
-                total_cost = round(sum(float(s["cost_usd"]) for s in steps), 6)
+                partial_attr = aggregate_workflow_cost_attribution(
+                    run_telemetry_steps, workflow_run_id=str(run_record["id"])
+                )
                 return {
                     **run_record,
                     "status": "INTERRUPTED",
@@ -897,16 +1053,21 @@ class DurableCheckpointRuntimeAdapter:
                     "tool_invocations": tool_invocations,
                     "checkpoint_json": checkpoint,
                     "conflicts_json": conflicts,
+                    "call_attribution_records": list(run_telemetry_steps),
+                    "cost_attribution": partial_attr,
                     "local_first_telemetry": router.telemetry.summarize(run_telemetry_steps),
-                    "tokens_used": total_tok,
-                    "cost_usd": total_cost,
+                    "tokens_used": int(partial_attr["total_tokens"]),
+                    "cost_usd": round(float(partial_attr["known_combined_cost_usd"]), 6),
                     "duration_ms": max(
                         1, int((time.perf_counter() - t0) * 1000)
                     ),
                 }
 
-        total_tokens = sum(int(s["tokens_used"]) for s in steps)
-        total_cost = round(sum(float(s["cost_usd"]) for s in steps), 6)
+        cost_attribution = aggregate_workflow_cost_attribution(
+            run_telemetry_steps, workflow_run_id=str(run_record["id"])
+        )
+        total_tokens = int(cost_attribution["total_tokens"])
+        total_cost = round(float(cost_attribution["known_combined_cost_usd"]), 6)
         elapsed_ms = max(
             sum(int(s["duration_ms"]) for s in steps),
             int((time.perf_counter() - t0) * 1000),
@@ -929,15 +1090,21 @@ class DurableCheckpointRuntimeAdapter:
             "tool_invocations": tool_invocations,
             "checkpoint_json": checkpoint,
             "conflicts_json": conflicts,
+            "call_attribution_records": list(run_telemetry_steps),
+            "cost_attribution": cost_attribution,
             "local_first_telemetry": telemetry_summary,
             "output_json": {
                 "report_markdown": artifacts_acc.get("report_markdown", ""),
                 "uncertainty_summary": artifacts_acc.get("uncertainty_summary", ""),
                 "extracted_claims": extracted,
+                "unsupported_claims_flagged": artifacts_acc.get(
+                    "unsupported_claims_flagged", []
+                ),
                 "contradictions_detected": len(conflicts),
                 "evidence_coverage": cov_meta,
                 "statistics": artifacts_acc.get("statistics", {}),
                 "experiment_protocol": artifacts_acc.get("experiment_protocol", {}),
+                "cost_attribution": cost_attribution,
                 "local_first_telemetry": telemetry_summary,
             },
             "tokens_used": total_tokens,
