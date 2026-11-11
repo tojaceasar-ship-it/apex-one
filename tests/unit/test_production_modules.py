@@ -119,6 +119,7 @@ def test_llm_gateway_live_http_fallback_and_embeddings() -> None:
                 "slug": "broken-primary",
                 "category": "cloud",
                 "base_url": f"http://127.0.0.1:{port}/fail",
+                "allow_dev_loopback": True,
                 "auth_env_var": "NONEXISTENT_ENV_1",
                 "fallback_provider_slug": "openai",
                 "enabled": True,
@@ -128,6 +129,7 @@ def test_llm_gateway_live_http_fallback_and_embeddings() -> None:
                 "slug": "openai",
                 "category": "cloud",
                 "base_url": f"http://127.0.0.1:{port}/v1",
+                "allow_dev_loopback": True,
                 "auth_env_var": "NONEXISTENT_ENV_2",
                 "fallback_provider_slug": "anthropic",
                 "enabled": True,
@@ -137,6 +139,7 @@ def test_llm_gateway_live_http_fallback_and_embeddings() -> None:
                 "slug": "anthropic",
                 "category": "cloud",
                 "base_url": f"http://127.0.0.1:{port}/v1",
+                "allow_dev_loopback": True,
                 "auth_env_var": "NONEXISTENT_ENV_3",
                 "enabled": True,
                 "models": [{"id": "claude-sonnet-4-0"}],
@@ -202,6 +205,7 @@ def test_llm_gateway_live_http_fallback_and_embeddings() -> None:
             provider_slug="openai",
             api_key="sk-live-orch",
             base_url=f"http://127.0.0.1:{port}/v1",
+            allow_dev_loopback=True,
         )
         run = svc.launch_agent_run(
             user_id=uid,

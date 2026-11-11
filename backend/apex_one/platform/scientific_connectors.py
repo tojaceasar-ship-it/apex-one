@@ -28,6 +28,7 @@ import httpx
 
 from apex_one.integrations_hub import SSRFBlockedError, assert_public_http_url
 from apex_one.platform.memory_and_docs import extract_document_text
+from apex_one.platform.ssrf_guard import EndpointTrustClass, execute_ssrf_guarded_request
 
 
 def validate_public_http_url(url: str) -> str:
@@ -118,35 +119,52 @@ def fetch_and_extract_url_source(
     max_bytes: int = 2_000_000,
     transport: httpx.BaseTransport | None = None,
 ) -> dict[str, Any]:
-    """Safely fetch an external URL (blocking SSRF targets) and extract primary text."""
+    """Safely fetch an external URL (blocking SSRF, DNS rebinding & unsafe redirects) and extract primary text."""
     validate_public_http_url(url)
 
-    current_url = url
-    resp: httpx.Response | None = None
-    ssl_ctx = ssl.create_default_context()
-    with httpx.Client(
-        timeout=timeout,
-        follow_redirects=False,
-        transport=transport,
-        verify=ssl_ctx,
-    ) as client:
-        for _ in range(4):
-            resp = client.get(current_url, headers={"User-Agent": USER_AGENT})
-            if resp.status_code in {301, 302, 303, 307, 308}:
-                loc = resp.headers.get("location")
-                if not loc:
-                    break
-                next_url = urllib.parse.urljoin(current_url, loc)
-                validate_public_http_url(next_url)
-                current_url = next_url
-                continue
-            break
+    if transport is not None:
+        current_url = url
+        resp: httpx.Response | None = None
+        ssl_ctx = ssl.create_default_context()
+        with httpx.Client(
+            timeout=timeout,
+            follow_redirects=False,
+            transport=transport,
+            verify=ssl_ctx,
+        ) as client:
+            for _ in range(4):
+                resp = client.get(current_url, headers={"User-Agent": USER_AGENT})
+                if resp.status_code in {301, 302, 303, 307, 308}:
+                    loc = resp.headers.get("location")
+                    if not loc:
+                        break
+                    next_url = urllib.parse.urljoin(current_url, loc)
+                    validate_public_http_url(next_url)
+                    current_url = next_url
+                    continue
+                break
+        assert resp is not None
+        resp.raise_for_status()
+        raw_bytes = resp.content[:max_bytes]
+        ctype = (resp.headers.get("content-type") or "").lower()
+    else:
+        guarded = execute_ssrf_guarded_request(
+            "GET",
+            url,
+            headers={"User-Agent": USER_AGENT},
+            trust_class=EndpointTrustClass.PUBLIC_PROVIDER,
+            allow_dev_loopback=False,
+            require_https=False,
+            connect_timeout=min(5.0, timeout),
+            read_timeout=timeout,
+            max_response_bytes=max_bytes,
+            max_redirects=3,
+        )
+        current_url = guarded.final_url
+        raw_bytes = guarded.body[:max_bytes]
+        ctype = (guarded.headers.get("content-type") or "").lower()
 
-    assert resp is not None
-    resp.raise_for_status()
-    raw_bytes = resp.content[:max_bytes]
     checksum = hashlib.sha256(raw_bytes).hexdigest()
-    ctype = (resp.headers.get("content-type") or "").lower()
 
     if "application/pdf" in ctype or current_url.lower().endswith(".pdf"):
         text, _ = extract_document_text(

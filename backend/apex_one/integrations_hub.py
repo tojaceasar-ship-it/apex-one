@@ -2,34 +2,52 @@
 
 from __future__ import annotations
 
-import ipaddress
 import os
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
 
 import httpx
 
+from apex_one.platform.ssrf_guard import (
+    EndpointTrustClass,
+    SSRFBlockedError,
+    normalize_origin,
+    resolve_and_validate_url,
+)
 
-class SSRFBlockedError(PermissionError):
-    """Raised when a generic REST or URL fetch targets a private or loopback IP."""
+__all__ = [
+    "SSRFBlockedError",
+    "assert_public_http_url",
+]
 
 
-def assert_public_http_url(url: str, *, allow_local: bool = False) -> str:
-    parts = urlsplit(url.strip())
-    if parts.scheme not in {"http", "https"} or not parts.hostname:
-        raise ValueError(f"Unsupported URL scheme or missing hostname in '{url}'.")
-    host = parts.hostname.lower()
-    if not allow_local:
-        if host in {"localhost", "metadata.google.internal"} or host.endswith(".local"):
-            raise SSRFBlockedError(f"Host '{host}' is blocked by SSRF policy.")
-        try:
-            ip = ipaddress.ip_address(host)
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                raise SSRFBlockedError(f"IP '{ip}' is blocked by SSRF policy.")
-        except ValueError:
-            pass
-    return url.strip()
+def assert_public_http_url(
+    url: str,
+    *,
+    allow_local: bool = False,
+    require_https: bool = False,
+    dns_resolver: Any = None,
+) -> str:
+    """Validate an outbound URL with DNS resolution and IPv4/IPv6 bogon enforcement."""
+    cleaned = url.strip()
+    if allow_local:
+        origin = normalize_origin(cleaned)
+        resolve_and_validate_url(
+            cleaned,
+            trust_class=EndpointTrustClass.CONTROLLED_LOCAL_MODEL,
+            owner_trusted_origins={origin},
+            dns_resolver=dns_resolver,
+        )
+        return cleaned
+
+    resolve_and_validate_url(
+        cleaned,
+        trust_class=EndpointTrustClass.PUBLIC_PROVIDER,
+        allow_dev_loopback=False,
+        require_https=require_https,
+        dns_resolver=dns_resolver,
+    )
+    return cleaned
 
 
 @dataclass(frozen=True)
