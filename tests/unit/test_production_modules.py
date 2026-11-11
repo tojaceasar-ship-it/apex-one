@@ -458,4 +458,20 @@ async def test_reverse_lan_bridge_relays_arena_preview_to_local_qwen36() -> None
     assert "38%" in infer_res["content"]
 
 
+def test_local_checkpoint_roundtrip_preserves_sessions_and_audit(tmp_path: Path) -> None:
+    ckpt = tmp_path / "apex_state.json"
+    svc = ApexPlatformService(seed_demo=True)
+    login = svc.login(email="admin@apex-one.local", password="ApexResearch!2026")
+    token = login["access_token"]
+    oid = login["active_organization_id"]
+    svc.save_local_checkpoint(ckpt)
+
+    restored = ApexPlatformService(seed_demo=False)
+    assert restored.load_local_checkpoint(ckpt) is True
+    ctx = restored.authenticate_token(token)
+    assert ctx["user"]["email"] == "admin@apex-one.local"
+    assert restored.audit.verify_chain(oid)["valid"] is True
+
+
+
 

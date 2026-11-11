@@ -188,13 +188,20 @@ class ApexPlatformService:
     )
 
     def save_local_checkpoint(self, file_path: Path) -> None:
+        from dataclasses import asdict
+
         file_path.parent.mkdir(parents=True, exist_ok=True)
         payload: dict[str, Any] = {
             k: getattr(self, k) for k in self._CHECKPOINT_FIELDS
         }
-        payload["_audit_events"] = list(self.audit._events)
+        payload["_audit_by_org"] = {
+            org_id: [asdict(e) for e in self.audit.get_chronological_entries(org_id)]
+            for org_id in self.organizations
+        }
         tmp = file_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8"
+        )
         tmp.replace(file_path)
 
     def load_local_checkpoint(self, file_path: Path) -> bool:
@@ -205,8 +212,8 @@ class ApexPlatformService:
             for k in self._CHECKPOINT_FIELDS:
                 if k in payload:
                     setattr(self, k, payload[k])
-            if "_audit_events" in payload:
-                self.audit._events = list(payload["_audit_events"])
+            for org_id, entries in (payload.get("_audit_by_org") or {}).items():
+                self.audit.hydrate_org_entries(org_id, entries)
             return True
         except Exception:
             return False

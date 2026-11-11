@@ -111,7 +111,10 @@ def create_app(
             if c.platform_persistence.active:
                 await c.platform_persistence.sync_to_postgres(c.platform)
             elif local_state_path is not None:
-                c.platform.save_local_checkpoint(local_state_path)
+                try:
+                    c.platform.save_local_checkpoint(local_state_path)
+                except Exception:
+                    pass
         response.headers["X-Request-ID"] = req_id
         response.headers["X-RateLimit-Remaining"] = str(remaining)
         return response  # type: ignore[no-any-return]
