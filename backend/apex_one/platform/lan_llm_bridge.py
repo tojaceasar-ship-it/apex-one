@@ -211,19 +211,23 @@ def build_lan_bridge_python_script(
     organization_id: str,
     lmstudio_url: str = "http://192.168.18.184:1234/v1",
     default_model: str = "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
+    extra_arena_urls: list[str] | None = None,
 ) -> str:
     """Return a Dual-Mode zero-dependency Python 3 bridge script for the user's PC."""
     clean_arena = arena_base_url.rstrip("/")
     clean_lms = lmstudio_url.rstrip("/")
+    candidates: list[str] = []
+    for u in [*(extra_arena_urls or []), clean_arena]:
+        cu = u.rstrip("/")
+        if cu and cu not in candidates:
+            candidates.append(cu)
     return f'''#!/usr/bin/env python3
 """APEX ONE — Dual-Mode Most LAN dla Arena Preview (Zero-Dependency Python 3).
 
-Działa w dwóch trybach jednocześnie, aby zagwarantować 100% łączności z Arena Preview:
-  1. Lokalny przekaźnik CORS/PNA na http://127.0.0.1:18765 -> {clean_lms}
-     (dla Twojej zalogowanej przeglądarki z otwartym Arena Preview — omija blokady cookie *.arena.site!)
-  2. Bezpośredni poller HTTPS do {clean_arena} (jeśli proxy chmurowe wpuszcza ruch CLI).
-
-Dodatkowo pobiera świeże 90-dniowe / 30-dniowe dane rynkowe Bitcoin (BTC/USD).
+Automatycznie testuje bezpośrednie endpointy chmurowe E2B oraz Arena Preview:
+  {candidates!r}
+i łączy je z Twoim lokalnym serwerem LM Studio ({clean_lms},
+model: {default_model}), pobierając również świeży kurs BTC/USD.
 
 Uruchomienie na Twoim komputerze:
     python apex_lan_bridge.py
@@ -245,6 +249,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+CANDIDATE_ARENA_URLS = {candidates!r}
 ARENA_URL = {clean_arena!r}
 AUTH_TOKEN = {auth_token!r}
 ORG_ID = {organization_id!r}
@@ -482,14 +487,40 @@ def make_local_cors_handler(lms_url: str):
     return _LocalRelayHandler
 
 
-def direct_https_poller(arena_url: str, lms_url: str, headers: dict, models: list[str], sync_btc: bool) -> None:
+def select_working_arena_url(candidates: list[str], headers: dict) -> str | None:
+    for candidate in candidates:
+        base = candidate.rstrip("/")
+        if not base:
+            continue
+        try:
+            _http_json(f"{{base}}/api/v1/lan-bridge/status", headers=headers, timeout=5.0)
+            print(f"[POŁĄCZONO BEZPOŚREDNIO Z CHMURĄ] Aktywny endpoint: {{base}}")
+            return base
+        except Exception as exc:
+            print(f"[TEST ENDPOINTU] {{base}} -> niedostępny dla CLI ({{type(exc).__name__}})")
+    return None
+
+
+def direct_https_poller(candidates: list[str], lms_url: str, headers: dict, models: list[str], sync_btc: bool) -> None:
     host_name = socket.gethostname()
+    arena_url = select_working_arena_url(candidates, headers)
+    if not arena_url:
+        print(
+            "\\n[WAŻNE — TRYB PRZEGLĄDARKOWY]\\n"
+            "  Chmura Arena wymaga połączenia z poziomu pełnej karty przeglądarki (poza ramką iframe).\\n"
+            f"  1. Zostaw to okno otwarte (nasłuchuje na http://127.0.0.1:{{LOCAL_PROXY_PORT}}).\\n"
+            f"  2. Otwórz NOWĄ KARTĘ w przeglądarce (Ctrl+T) i wklej ręcznie adres:\\n"
+            f"     {{ARENA_URL}}/models\\n"
+            "  3. W nowej karcie kliknij zielony przycisk '2. Połącz przeglądarkę z mostem lokalnym'.\\n"
+        )
+        return
+
     if sync_btc:
         snap = build_live_btc_markdown()
         if snap:
             try:
                 _http_json(
-                    f"{{arena_url.rstrip('/')}}/api/v1/sources",
+                    f"{{arena_url}}/api/v1/sources",
                     method="POST",
                     payload={{
                         "source_type": "MD",
@@ -500,14 +531,14 @@ def direct_https_poller(arena_url: str, lms_url: str, headers: dict, models: lis
                     headers=headers,
                     timeout=10.0,
                 )
-                print("[OK] Wgrano snapshot BTC/USD bezpośrednio do Arena Preview!")
+                print("[OK] Wgrano świeży snapshot BTC/USD bezpośrednio do Arena Preview!")
             except Exception:
                 pass
 
     while True:
         try:
             poll_resp = _http_json(
-                f"{{arena_url.rstrip('/')}}/api/v1/lan-bridge/poll",
+                f"{{arena_url}}/api/v1/lan-bridge/poll",
                 method="POST",
                 payload={{
                     "endpoint": lms_url,
@@ -530,31 +561,25 @@ def direct_https_poller(arena_url: str, lms_url: str, headers: dict, models: lis
                 print(f"BŁĄD: {{exc}}")
                 result = {{"error": str(exc)}}
             _http_json(
-                f"{{arena_url.rstrip('/')}}/api/v1/lan-bridge/complete",
+                f"{{arena_url}}/api/v1/lan-bridge/complete",
                 method="POST",
                 payload={{"job_id": jid, "result": result}},
                 headers=headers,
                 timeout=15.0,
             )
-        except PermissionError:
-            print("[TRYB PRZEGLĄDARKOWY] Proxy *.arena.site wymaga cookie przeglądarki — użyj przycisku 'Połącz z lokalnym mostem (127.0.0.1:18765)' w karcie Modele i Dostawcy!")
-            return
-        except HTTPError as exc:
-            if exc.code in (401, 403):
-                print(f"[TRYB PRZEGLĄDARKOWY] HTTP {{exc.code}} na połączeniu bezpośrednim — używam lokalnego portu http://127.0.0.1:{{LOCAL_PROXY_PORT}} dla Twojej przeglądarki!")
-                return
-            time.sleep(3.0)
         except Exception:
             time.sleep(3.0)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="APEX ONE Dual-Mode LAN Bridge")
-    parser.add_argument("--arena-url", default=ARENA_URL)
+    parser.add_argument("--arena-url", default="")
     parser.add_argument("--lms-url", default=DEFAULT_LMS_URL)
     parser.add_argument("--port", type=int, default=LOCAL_PROXY_PORT)
     parser.add_argument("--no-btc", action="store_true")
     args = parser.parse_args()
+
+    url_list = [args.arena_url] + list(CANDIDATE_ARENA_URLS) if args.arena_url else list(CANDIDATE_ARENA_URLS)
 
     print("=" * 74)
     print(" APEX ONE — Dual-Mode Most LAN dla Arena Preview")
@@ -579,13 +604,13 @@ def main() -> None:
     }}
     t = threading.Thread(
         target=direct_https_poller,
-        args=(args.arena_url, args.lms_url, headers, models, not args.no_btc),
+        args=(url_list, args.lms_url, headers, models, not args.no_btc),
         daemon=True,
     )
     t.start()
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), make_local_cors_handler(args.lms_url))
-    print(f"[GOTOWY] Nasłuchuję na http://127.0.0.1:{{args.port}} — kliknij 'Połącz przeglądarkę z mostem lokalnym' w Arena Preview (Ctrl+C aby zakończyć).")
+    print(f"[GOTOWY] Serwer mostu działa na http://127.0.0.1:{{args.port}} (Ctrl+C aby zakończyć).")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

@@ -126,9 +126,10 @@ class BrowserLanBridgeController {
     }
 
     const inIframe = typeof window !== "undefined" && window.self !== window.top;
+    const currentUrl = typeof window !== "undefined" ? window.location.href : "";
     const hint = inIframe
-      ? "Przeglądarka zablokowała połączenie z siecią lokalną wewnątrz osadzonej ramki (iframe) LUB nie uruchomiono jeszcze skryptu `python apex_lan_bridge.py`. Najpierw uruchom `python apex_lan_bridge.py` na komputerze, a jeśli nadal widzisz ten komunikat — kliknij przycisk 'Otwórz podgląd w pełnej karcie ↗' obok i tam kliknij 'Połącz'."
-      : "Nie udało się połączyć ani z `python apex_lan_bridge.py` (port 18765), ani bezpośrednio z LM Studio (włącz 'Enable CORS' w zakładce Developer w LM Studio lub uruchom `python apex_lan_bridge.py`).";
+      ? `Ramka podglądu Arena (<iframe sandbox>) blokuje w przeglądarce zarówno dostęp do sieci lokalnej (127.0.0.1 / 192.168.x.x), jak i automatyczne otwieranie wyskakujących okien. Rozwiązanie: (A) Uruchom na komputerze nowy skrypt 'python apex_lan_bridge.py' (łączy się sam bezpośrednio z portem chmurowym E2B — odznaka na górze zmieni się na ZIELONĄ automatycznie!), LUB (B) zaznacz i skopiuj ręcznie (Ctrl+C) adres podglądu: ${currentUrl} , otwórz nową kartę w przeglądarce (Ctrl+T), wklej adres (Ctrl+V) i tam kliknij zielony przycisk.`
+      : "Nie udało się połączyć z mostem na 127.0.0.1:18765 ani z LM Studio na porcie 1234. Upewnij się, że w terminalu na Twoim komputerze działa `python apex_lan_bridge.py` (lub włącz 'Enable CORS' w LM Studio).";
 
     this.update({
       active: false,

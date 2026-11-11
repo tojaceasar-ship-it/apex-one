@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from typing import Any, Literal
 
 from fastapi import (
@@ -1332,12 +1333,22 @@ def create_platform_router(get_platform: Any) -> APIRouter:
         if local_state_env is not None:
             svc.save_local_checkpoint(local_state_env)
         arena_base = (origin or str(request.base_url)).rstrip("/")
+        sbx_id = os.environ.get("E2B_SANDBOX_ID", "").strip()
+        extra_urls = (
+            [
+                f"https://8000-{sbx_id}.e2b.app",
+                f"https://5173-{sbx_id}.e2b.app",
+            ]
+            if sbx_id
+            else []
+        )
         script_body = build_lan_bridge_python_script(
             arena_base_url=arena_base,
             auth_token=str(key_rec["secret_key_once"]),
             organization_id=ctx["organization_id"],
             lmstudio_url=lmstudio_url,
             default_model=model,
+            extra_arena_urls=extra_urls,
         )
         return PlainTextResponse(
             content=script_body,

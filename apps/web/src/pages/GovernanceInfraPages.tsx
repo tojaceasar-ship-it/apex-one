@@ -251,19 +251,39 @@ export function ModelsProvidersPage() {
     }
   };
 
+  const copyTextWithIframeFallback = async (text: string): Promise<boolean> => {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        const ok = document.execCommand("copy");
+        ta.remove();
+        return ok;
+      } catch {
+        return false;
+      }
+    }
+  };
+
   const handleCopyBridgeScript = async () => {
     setErrMsg(null);
     try {
-      const code = bridgeScriptPreview || (await fetchBridgeScriptText());
+      const code = await fetchBridgeScriptText();
       setBridgeScriptPreview(code);
-      try {
-        await navigator.clipboard.writeText(code);
-        setStatusMsg(
-          "Skopiowano prawdziwy kod Pythona (apex_lan_bridge.py) do schowka! Zapisz go na dysku, uruchom `python apex_lan_bridge.py`, a potem kliknij '2. Połącz przeglądarkę z mostem lokalnym'."
-        );
-      } catch {
-        setStatusMsg("Zaznacz cały kod Pythona z pola tekstowego poniżej (Ctrl+A, Ctrl+C).");
-      }
+      const copied = await copyTextWithIframeFallback(code);
+      setStatusMsg(
+        copied
+          ? "Skopiowano zaktualizowany skrypt apex_lan_bridge.py do schowka! Zapisz go na dysku i uruchom: python apex_lan_bridge.py (skrypt sam przetestuje bezpośredni port chmury E2B)."
+          : "Wyświetlono kod poniżej — kliknij w pole kodu, naciśnij Ctrl+A, potem Ctrl+C, zapisz jako apex_lan_bridge.py i uruchom: python apex_lan_bridge.py."
+      );
     } catch (ex: any) {
       setErrMsg(ex.message);
     }
@@ -408,18 +428,22 @@ export function ModelsProvidersPage() {
                 ? "Połączono z LM Studio (Odśwież)"
                 : "2. Połącz przeglądarkę z mostem lokalnym"}
             </button>
-            {typeof window !== "undefined" && window.self !== window.top && (
-              <a
-                href={window.location.href}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="rounded-lg border border-amber-400/40 bg-amber-500/10 px-3 py-2 font-medium text-amber-200 hover:bg-amber-500/20"
-              >
-                Otwórz podgląd w pełnej karcie ↗
-              </a>
-            )}
           </div>
         </div>
+        {typeof window !== "undefined" && window.self !== window.top && !isAnyBridgeOnline && (
+          <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 text-xs text-amber-100">
+            <div className="mb-1 font-medium">
+              Wskazówka (jeśli ramka Arena blokuje połączenie z <code>127.0.0.1</code>): skopiuj ręcznie poniższy adres (<code>Ctrl+C</code>), otwórz nową kartę w przeglądarce (<code>Ctrl+T</code>) i wklej go w pasek adresu (<code>Ctrl+V</code>):
+            </div>
+            <input
+              readOnly
+              value={window.location.href}
+              onFocus={(e) => e.currentTarget.select()}
+              onClick={(e) => e.currentTarget.select()}
+              className="w-full rounded border border-amber-400/40 bg-zinc-950 px-2.5 py-1.5 font-mono text-[11px] text-amber-200"
+            />
+          </div>
+        )}
         {bridgeScriptPreview && (
           <div className="mt-3 space-y-1.5">
             <div className="flex items-center justify-between text-[11px] text-zinc-400">
