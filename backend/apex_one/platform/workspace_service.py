@@ -1519,7 +1519,7 @@ class ApexPlatformService:
                 memory_type="document",
                 title=f"Źródło: {title}",
                 content=safety.sanitized_text,
-                source_ref=f"source://{sid}/{uri_or_filename}",
+                source_ref=f"source://{sid}/{safe_uri_or_filename}",
                 project_id=research_project_id,
                 workspace_scope=workspace_scope,
             )
@@ -2060,6 +2060,19 @@ class ApexPlatformService:
         query: str,
     ) -> tuple[list[float], EmbeddingSpaceMetadata]:
         active_space = self.get_active_embedding_space(organization_id)
+        for mid, mem in self.memories.items():
+            if (
+                mem.get("organization_id") != organization_id
+                or mem.get("retention_state") != "active"
+            ):
+                continue
+            mem_space = mem.get("embedding_index_metadata")
+            if isinstance(mem_space, dict) and mem_space.get("embedding_model"):
+                assert_compatible_embedding_spaces(mem_space, active_space)
+            for ch in self.memory_chunks.get(mid, []):
+                ch_space = (ch.get("metadata") or {}).get("embedding_space")
+                if isinstance(ch_space, dict) and ch_space.get("embedding_model"):
+                    assert_compatible_embedding_spaces(ch_space, active_space)
         providers = self.model_providers.get(organization_id, [])
         return self.llm_gateway.embed_with_space_contract(
             query,

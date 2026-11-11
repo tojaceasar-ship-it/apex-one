@@ -269,9 +269,18 @@ def test_06_concurrent_atomic_checkpoint_writes_and_corruption_detection(
     assert untouched.default_org_id == ""
 
 
-def test_07_environment_status_honestly_reports_single_vs_multi_instance_persistence() -> None:
+def test_07_environment_status_honestly_reports_single_vs_multi_instance_persistence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """7. `/api/v1/environment/status` honestly reports single-instance checkpoint vs PostgreSQL multi-instance OCC."""
-    settings = Settings(env="test", enable_demo_seed=False, database_url=None)
+    monkeypatch.delenv("APEX_DATABASE_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    settings = Settings(
+        env="test",
+        enable_demo_seed=False,
+        apex_database_url=None,
+        database_url=None,
+    )
     app = create_app(settings=settings, seed_demo=False)
 
     with TestClient(app) as client:
