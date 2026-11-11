@@ -59,6 +59,7 @@ from apex_one.platform.research_engine import (
 from apex_one.platform.scientific_connectors import (
     discover_scientific_literature,
     fetch_and_extract_url_source,
+    fetch_live_btc_market_telemetry,
 )
 from apex_one.platform.security import (
     ROLE_PERMISSIONS,
@@ -963,15 +964,19 @@ class ApexPlatformService:
         organization_id: str,
         research_project_id: str | None,
     ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-        project_sources = [
-            s
-            for s in self.sources.values()
-            if s["organization_id"] == organization_id
-            and (
-                research_project_id is None
-                or s.get("research_project_id") == research_project_id
-            )
-        ]
+        project_sources = sorted(
+            [
+                s
+                for s in self.sources.values()
+                if s["organization_id"] == organization_id
+                and (
+                    research_project_id is None
+                    or s.get("research_project_id") == research_project_id
+                )
+            ],
+            key=lambda x: str(x.get("created_at") or ""),
+            reverse=True,
+        )
         agents_by_slug: dict[str, dict[str, Any]] = {}
         for a in self.agents.values():
             if a["organization_id"] != organization_id:
@@ -1464,16 +1469,40 @@ class ApexPlatformService:
         research_project_id: str | None,
         workspace_scope: str = "research",
     ) -> list[dict[str, Any]]:
+        registered: list[dict[str, Any]] = []
+        q_low = query.lower()
+        if "bitcoin" in q_low or "btc" in q_low:
+            btc_snap = fetch_live_btc_market_telemetry()
+            if btc_snap is not None:
+                try:
+                    src = self.register_source(
+                        user_id=user_id,
+                        organization_id=organization_id,
+                        source_type="MD",
+                        title=btc_snap["title"],
+                        uri_or_filename="btc_usd_live_30d_telemetry.md",
+                        raw_text=btc_snap["markdown"],
+                        research_project_id=research_project_id,
+                        workspace_scope=workspace_scope,
+                    )
+                    registered.append(src)
+                except Exception:
+                    pass
+            scholar_q = "Bitcoin volatility drawdown 30-day GARCH prediction"
+        else:
+            scholar_q = query
+
         res = self.discover_sources(
             user_id=user_id,
             organization_id=organization_id,
-            query=query,
+            query=scholar_q,
             connectors=["arxiv", "openalex", "github"],
             max_per_connector=3,
             auto_register_project_id=research_project_id,
             workspace_scope=workspace_scope,
         )
-        return list(res.get("registered_sources", []))
+        registered.extend(res.get("registered_sources", []))
+        return registered
 
     def create_claim_and_evidence(
         self,

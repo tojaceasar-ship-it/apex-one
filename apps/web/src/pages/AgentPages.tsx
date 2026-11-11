@@ -764,11 +764,12 @@ export function RunsExecutionsPage() {
           </h2>
           <button
             type="button"
-            onClick={() =>
+            onClick={() => {
               setObjective(
                 "Oceń szanse spadku ceny Bitcoina (BTC/USD) w ciągu najbliższych 30 dni. Wyznacz oszacowanie prawdopodobieństwa dla trzech progów spadku: (A) korekta >= 5%, (B) korekta >= 10%, (C) głęboki spadek >= 20%. Uwzględnij zmienność zrealizowaną 30D, przepływy ETF, derywaty i czynniki makro oraz wskaż sprzeczności i przedział ufności."
-              )
-            }
+              );
+              setAutoDiscover(true);
+            }}
             className="rounded-full border border-indigo-400/35 bg-indigo-500/10 px-3 py-1 text-[11px] font-medium text-indigo-200 hover:bg-indigo-500/20"
           >
             + Wstaw test: Szansa spadku Bitcoina (BTC) w 30 dni
@@ -936,13 +937,18 @@ export function RunsExecutionsPage() {
                   key={st.id}
                   className="rounded-lg border border-zinc-800 bg-zinc-900/70 p-2.5 text-xs"
                 >
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-1">
                     <span className="font-semibold text-zinc-200">
                       #{st.step_index} {st.agent_slug}
                     </span>
-                    <Badge tone={st.status === "SUCCEEDED" ? "emerald" : "neutral"}>
-                      {st.status}
-                    </Badge>
+                    <div className="flex items-center gap-1">
+                      {st.output_json?.live_llm_invoked && (
+                        <Badge tone="indigo">LIVE LLM</Badge>
+                      )}
+                      <Badge tone={st.status === "SUCCEEDED" ? "emerald" : "neutral"}>
+                        {st.status}
+                      </Badge>
+                    </div>
                   </div>
                   <div className="mt-1 truncate text-[11px] text-zinc-400">
                     {st.task_title}
@@ -950,6 +956,20 @@ export function RunsExecutionsPage() {
                 </div>
               ))}
             </div>
+
+            {r.output_json?.report_markdown && (
+              <details
+                open={runs[0]?.id === r.id}
+                className="mt-4 rounded-xl border border-indigo-500/30 bg-zinc-950/90 p-3.5 text-xs"
+              >
+                <summary className="cursor-pointer font-semibold text-indigo-300">
+                  Końcowy Raport Badawczy Zespołu Agentów (Kliknij, aby zwinąć / rozwinąć)
+                </summary>
+                <pre className="mt-3 max-h-[34rem] overflow-y-auto whitespace-pre-wrap leading-relaxed text-zinc-200">
+                  {r.output_json.report_markdown}
+                </pre>
+              </details>
+            )}
           </Card>
         ))}
       </div>

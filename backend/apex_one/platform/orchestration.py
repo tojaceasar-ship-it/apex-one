@@ -522,14 +522,26 @@ class DurableCheckpointRuntimeAdapter:
                     or f"You are specialist research agent '{slug}'."
                 )
                 src_digest = "\n".join(
-                    f"- [{s['id'][:8]}] {s['title']}: {str(s.get('extracted_text') or '')[:320]}"
+                    f"- [{s['id'][:8]}] {s['title']}:\n{str(s.get('extracted_text') or '')[:900]}"
                     for s in project_sources[:6]
+                )
+                prior_notes = "\n".join(
+                    f"- Step #{prev['step_index']} ({prev['agent_slug']}): "
+                    f"{str((prev.get('output_json') or {}).get('llm_reasoning') or '')[:350]}"
+                    for prev in steps[: s_idx - 1]
+                    if (prev.get("output_json") or {}).get("llm_reasoning")
                 )
                 user_msg = (
                     f"Research Objective: {objective}\n"
-                    f"Current Specialist Step ({s_idx}): {step['task_title']}\n"
+                    f"Current Specialist Step ({s_idx}): {step['task_title']} (role={slug})\n"
                     f"Primary Sources:\n{src_digest or '(no external sources attached)'}\n"
-                    "Provide a concise, evidence-grounded analytical output."
+                    + (
+                        f"Prior Specialist Findings:\n{prior_notes}\n"
+                        if prior_notes and slug == "research-writer"
+                        else ""
+                    )
+                    + "Respond in the same language as the Research Objective (Polish if Polish). "
+                    "Provide a rigorous, quantitative, evidence-grounded output."
                 )
                 llm_res = llm_gateway.complete_sync(
                     organization_id=organization_id,

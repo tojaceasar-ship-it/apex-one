@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import math
 import os
 import re
 import ssl
+import statistics
 import urllib.parse
 import xml.etree.ElementTree as ET
+from datetime import UTC, datetime
 from html.parser import HTMLParser
 from typing import Any
 
@@ -427,4 +430,112 @@ def discover_scientific_literature(
         "connector_statuses": provider_diagnostics,
         "items": results,
         "results": results,
+    }
+
+
+def fetch_live_btc_market_telemetry(*, timeout: float = 5.0) -> dict[str, str] | None:
+    """Fetch real 90-day BTC/USD candles and compute 30-day volatility & drawdown stats."""
+    closes: list[float] = []
+    highs: list[float] = []
+    lows: list[float] = []
+    source_label = "Binance Spot BTCUSDT (1D)"
+    headers = {
+        "User-Agent": "APEX-ONE-Research-Workbench/1.0",
+        "Accept": "application/json",
+    }
+    try:
+        with httpx.Client(
+            timeout=timeout, headers=headers, verify=ssl.create_default_context()
+        ) as client:
+            try:
+                r = client.get(
+                    "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=90"
+                )
+                r.raise_for_status()
+                for row in r.json():
+                    highs.append(float(row[2]))
+                    lows.append(float(row[3]))
+                    closes.append(float(row[4]))
+            except Exception:
+                source_label = "CoinGecko BTC/USD (90D)"
+                r2 = client.get(
+                    "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=90&interval=daily"
+                )
+                r2.raise_for_status()
+                closes = [float(p[1]) for p in (r2.json().get("prices") or [])]
+                highs = list(closes)
+                lows = list(closes)
+    except Exception:
+        return None
+
+    if len(closes) < 32:
+        return None
+
+    spot = closes[-1]
+    chg_7d = ((spot / closes[-8]) - 1.0) * 100.0 if len(closes) >= 8 else 0.0
+    chg_30d = ((spot / closes[-31]) - 1.0) * 100.0
+    log_rets = [
+        math.log(closes[i] / closes[i - 1])
+        for i in range(1, len(closes))
+        if closes[i - 1] > 0
+    ]
+    daily_vol = (
+        statistics.stdev(log_rets[-30:])
+        if len(log_rets) >= 30
+        else statistics.stdev(log_rets)
+    )
+    ann_vol_pct = daily_vol * math.sqrt(365.0) * 100.0
+    vol_30d = daily_vol * math.sqrt(30.0)
+
+    windows = 0
+    dd_5 = dd_10 = dd_20 = 0
+    for start in range(0, len(closes) - 30):
+        entry = closes[start]
+        min_low = min(lows[start + 1 : start + 31])
+        dd = (min_low - entry) / entry
+        windows += 1
+        if dd <= -0.05:
+            dd_5 += 1
+        if dd <= -0.10:
+            dd_10 += 1
+        if dd <= -0.20:
+            dd_20 += 1
+
+    def _norm_cdf(x: float) -> float:
+        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+    p_close_5 = (
+        _norm_cdf((math.log(0.95) + 0.5 * vol_30d * vol_30d) / max(vol_30d, 1e-6))
+        * 100.0
+    )
+    p_close_10 = (
+        _norm_cdf((math.log(0.90) + 0.5 * vol_30d * vol_30d) / max(vol_30d, 1e-6))
+        * 100.0
+    )
+    p_close_20 = (
+        _norm_cdf((math.log(0.80) + 0.5 * vol_30d * vol_30d) / max(vol_30d, 1e-6))
+        * 100.0
+    )
+
+    now_str = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    md = (
+        f"# Empiryczna Telemetria Rynkowa Bitcoin (BTC/USD) — {now_str}\n"
+        f"- Źródło kwotowań: {source_label} (okno 90 dni)\n"
+        f"- Aktualny kurs spot BTC/USD: ${spot:,.2f}\n"
+        f"- Zmiana 7-dniowa: {chg_7d:+.2f}% | Zmiana 30-dniowa: {chg_30d:+.2f}%\n"
+        f"- Zmienność zrealizowana 30D (annualizowana): {ann_vol_pct:.2f}% "
+        f"(dzienna sigma={daily_vol * 100:.2f}%, 30D sigma={vol_30d * 100:.2f}%)\n"
+        f"- Empiryczna częstość wystąpienia obsunięcia w kroczących oknach 30-dniowych "
+        f"(ostatnie 90 dni, n={windows} okien):\n"
+        f"  * Korekta wewnątrzokresowa >= 5%: {(dd_5 / max(windows, 1)) * 100:.1f}% okien\n"
+        f"  * Korekta wewnątrzokresowa >= 10%: {(dd_10 / max(windows, 1)) * 100:.1f}% okien\n"
+        f"  * Głęboki spadek wewnątrzokresowy >= 20%: {(dd_20 / max(windows, 1)) * 100:.1f}% okien\n"
+        f"- Analityczne prawdopodobieństwo log-normalne na zamknięcie za 30 dni (neutralny dryf):\n"
+        f"  * Kurs za 30D <= -5% (${spot * 0.95:,.0f}): {p_close_5:.1f}%\n"
+        f"  * Kurs za 30D <= -10% (${spot * 0.90:,.0f}): {p_close_10:.1f}%\n"
+        f"  * Kurs za 30D <= -20% (${spot * 0.80:,.0f}): {p_close_20:.1f}%\n"
+    )
+    return {
+        "title": f"Live BTC/USD Market Telemetry ({now_str})",
+        "markdown": md,
     }
